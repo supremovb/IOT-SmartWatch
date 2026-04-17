@@ -90,41 +90,49 @@ class _SOSScreenState extends State<SOSScreen> {
         ),
         border: Border.all(color: Colors.red, width: 2),
       ),
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              _chip('LIVE', const Color(0xFF28C76F)),
+              _chip('SOS', Colors.redAccent),
+            ],
+          ),
+          const SizedBox(height: 8),
+          const Row(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: const [
-              Icon(Icons.warning_amber_rounded, color: Colors.red, size: 24),
+            children: [
+              Icon(Icons.warning_amber_rounded, color: Colors.red, size: 22),
               SizedBox(width: 8),
               Text(
                 'EMERGENCY',
                 style: TextStyle(
-                  fontSize: 24,
+                  fontSize: 22,
                   fontWeight: FontWeight.bold,
                   color: Colors.red,
-                  letterSpacing: 1.5,
+                  letterSpacing: 1.4,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           const Text(
             'SOS',
             style: TextStyle(
-              fontSize: 44,
+              fontSize: 42,
               fontWeight: FontWeight.w800,
               color: Colors.white,
             ),
           ),
-          const SizedBox(height: 22),
+          const SizedBox(height: 18),
           GestureDetector(
             onTap: _sending ? null : _sendSOS,
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 250),
-              width: 122,
-              height: 122,
+              width: 118,
+              height: 118,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: _sent ? Colors.green : Colors.red,
@@ -147,22 +155,35 @@ class _SOSScreenState extends State<SOSScreen> {
                           strokeWidth: 3,
                         ),
                       )
-                    : Icon(
-                        _sent ? Icons.check_rounded : Icons.health_and_safety_rounded,
-                        size: 46,
-                        color: Colors.white,
+                    : const Text(
+                        'SOS',
+                        style: TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                        ),
                       ),
               ),
             ),
           ),
           const SizedBox(height: 18),
           Text(
-            _sending ? 'Sending emergency alert...' : 'Tap to send SOS alert',
+            _sending ? 'Sending emergency alert...' : 'Tap circle to send',
             style: TextStyle(fontSize: 13, color: Colors.grey[400]),
           ),
           const SizedBox(height: 12),
           Text(
+            widget.controller.deviceId,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: accent,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
             _status,
+            textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 18,
               fontWeight: FontWeight.bold,
@@ -170,6 +191,25 @@ class _SOSScreenState extends State<SOSScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _chip(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.65)),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w800,
+          color: color,
+        ),
       ),
     );
   }

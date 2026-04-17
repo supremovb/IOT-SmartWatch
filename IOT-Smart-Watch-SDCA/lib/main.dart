@@ -5,6 +5,7 @@ import 'models/watch_data.dart';
 import 'screens/watch_face_screen.dart';
 import 'screens/heart_rate_screen.dart';
 import 'screens/steps_screen.dart';
+import 'screens/patient_screen.dart';
 import 'screens/sos_screen.dart';
 import 'services/esp32_service.dart';
 
@@ -57,9 +58,10 @@ class _WatchShellState extends State<_WatchShell> {
   int _page = 0;
 
   static const List<({IconData icon, String label})> _screens = [
-    (icon: Icons.watch_outlined, label: 'Watch'),
-    (icon: Icons.favorite_rounded, label: 'Heart'),
-    (icon: Icons.directions_walk_rounded, label: 'Activity'),
+    (icon: Icons.watch_outlined, label: 'W'),
+    (icon: Icons.favorite_rounded, label: 'H'),
+    (icon: Icons.directions_walk_rounded, label: 'A'),
+    (icon: Icons.person_rounded, label: 'P'),
     (icon: Icons.warning_amber_rounded, label: 'SOS'),
   ];
 
@@ -184,17 +186,7 @@ class _WatchShellState extends State<_WatchShell> {
         decoration: const BoxDecoration(color: Colors.black),
         child: Column(
           children: [
-            // Page indicator
-            ListenableBuilder(
-              listenable: _ctrl,
-              builder: (context, _) => _PageDots(
-                page: _page,
-                total: _screens.length,
-                accent: _ctrl.accentColor,
-                unreadAt: -1,
-                hasUnread: false,
-              ),
-            ),
+            const SizedBox(height: 4),
 
             // Screens
             Expanded(
@@ -209,6 +201,7 @@ class _WatchShellState extends State<_WatchShell> {
                   WatchFaceScreen(controller: _ctrl),
                   HeartRateScreen(controller: _ctrl),
                   StepsScreen(controller: _ctrl),
+                  PatientScreen(controller: _ctrl),
                   SOSScreen(controller: _ctrl),
                 ],
               ),
@@ -302,84 +295,46 @@ class _BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    const tabColors = [
+      Color(0xFF00D4FF),
+      Color(0xFFFF5252),
+      Color(0xFF28C76F),
+      Color(0xFF4DA3FF),
+      Color(0xFFFF5252),
+    ];
+
     return Container(
-      height: 54,
+      height: 36,
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
       decoration: const BoxDecoration(
         color: Color(0xFF080808),
         border: Border(top: BorderSide(color: Colors.white10)),
       ),
       child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: List.generate(screens.length, (i) {
           final active = i == page;
-          final isNotif = i == 4;
-          return Expanded(
-            child: GestureDetector(
-              onTap: () => onTap(i),
-              behavior: HitTestBehavior.opaque,
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 200),
-                decoration: BoxDecoration(
-                  border: Border(
-                    top: BorderSide(
-                      color: active ? accent : Colors.transparent,
-                      width: 2,
-                    ),
-                  ),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Stack(
-                      clipBehavior: Clip.none,
-                      children: [
-                        AnimatedScale(
-                          duration: const Duration(milliseconds: 200),
-                          scale: active ? 1.08 : 1.0,
-                          child: Icon(
-                            screens[i].icon,
-                            size: active ? 22 : 18,
-                            color: active ? accent : Colors.white30,
-                          ),
-                        ),
-                        if (isNotif && unread > 0)
-                          Positioned(
-                            right: -7,
-                            top: -5,
-                            child: Container(
-                              width: 14,
-                              height: 14,
-                              decoration: BoxDecoration(
-                                color: accent,
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                    color: Colors.black, width: 1.5),
-                              ),
-                              child: Center(
-                                child: Text(
-                                  '$unread',
-                                  style: const TextStyle(
-                                      fontSize: 7,
-                                      color: Colors.black,
-                                      fontWeight: FontWeight.bold),
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      screens[i].label,
-                      style: TextStyle(
-                        fontSize: 8,
-                        color: active ? accent : Colors.white24,
-                        fontWeight: active
-                            ? FontWeight.w700
-                            : FontWeight.normal,
-                        letterSpacing: 0.3,
-                      ),
-                    ),
-                  ],
+          final fill = active ? tabColors[i] : const Color(0xFF2A2A2A);
+          final textColor = active ? Colors.black : Colors.white;
+
+          return GestureDetector(
+            onTap: () => onTap(i),
+            behavior: HitTestBehavior.opaque,
+            child: Container(
+              width: i == 4 ? 36 : 28,
+              height: 24,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: fill,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: tabColors[i]),
+              ),
+              child: Text(
+                screens[i].label,
+                style: TextStyle(
+                  fontSize: i == 4 ? 8 : 10,
+                  fontWeight: FontWeight.w800,
+                  color: textColor,
                 ),
               ),
             ),

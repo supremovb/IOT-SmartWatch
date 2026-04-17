@@ -11,6 +11,16 @@ class WatchController extends ChangeNotifier {
   // Steps Data
   int _currentSteps = 5234;
   int _dailyStepGoal = 10000;
+  int _bloodOxygen = 98;
+  double _temperatureF = 98.6;
+  bool _patientLinked = true;
+  String _patientName = 'Juan Dela Cruz';
+  int _patientAge = 67;
+  String _patientRisk = 'Stable';
+  String _patientCondition = 'Under observation';
+  String _patientNotes = 'Monitor vitals regularly';
+  String _deviceId = 'WATCH-ESP32-001';
+  bool _imuReady = true;
 
   // Timer Data
   Duration _timerDuration = Duration.zero;
@@ -316,6 +326,8 @@ class WatchController extends ChangeNotifier {
     heartRate: _currentHeartRate,
     steps: _currentSteps,
     battery: _batteryLevel,
+    bloodOxygen: _bloodOxygen.toDouble(),
+    temperatureF: _temperatureF,
   );
 
   double get weatherTemp => _weatherTemp;
@@ -327,6 +339,14 @@ class WatchController extends ChangeNotifier {
   double get weatherLow => _weatherLow;
 
   int get batteryLevel => _batteryLevel;
+  bool get patientLinked => _patientLinked;
+  String get patientName => _patientName;
+  int get patientAge => _patientAge;
+  String get patientRisk => _patientRisk;
+  String get patientCondition => _patientCondition;
+  String get patientNotes => _patientNotes;
+  String get deviceId => _deviceId;
+  bool get imuReady => _imuReady;
 
   void setWeather(double temp, String condition, double high, double low) {
     _weatherTemp = temp;
@@ -568,6 +588,7 @@ class HealthData {
   final int sleepHours;
   final int sleepMinutes;
   final double bloodOxygen;
+  final double temperatureF;
 
   HealthData({
     required this.heartRate,
@@ -578,5 +599,6 @@ class HealthData {
     this.sleepHours = 7,
     this.sleepMinutes = 30,
     this.bloodOxygen = 98.0,
+    this.temperatureF = 98.6,
   });
 }

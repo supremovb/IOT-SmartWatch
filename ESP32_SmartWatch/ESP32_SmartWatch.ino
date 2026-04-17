@@ -112,6 +112,8 @@ String popupMessage = "";
 uint16_t popupColor = C_ACCENT;
 bool popupVisible = false;
 unsigned long popupUntilMs = 0;
+int screenScrollOffset = 0;
+int touchStartScrollOffset = 0;
 
 // ─── Step Detection State ──────────────────────────────────────────────────
 float accMagFiltered = 8192.0;
@@ -276,6 +278,15 @@ bool getTouchXY(uint16_t &tx, uint16_t &ty) {
   return true;
 }
 
+int getMaxScrollForScreen() {
+  switch (currentScreen) {
+    case 1: return 34;
+    case 2: return 24;
+    case 3: return 92;
+    default: return 0;
+  }
+}
+
 void showCurrentScreen() {
   switch (currentScreen) {
     case 0: drawWatchFace(); break;
@@ -297,6 +308,7 @@ void handleTap(uint16_t x, uint16_t y) {
 
     if (currentScreen != target) {
       currentScreen = target;
+      screenScrollOffset = 0;
       showCurrentScreen();
     }
     return;
@@ -322,6 +334,7 @@ void processTouchPoint(uint16_t x, uint16_t y) {
     swipeHandled = false;
     touchStartX = x;
     touchStartY = y;
+    touchStartScrollOffset = screenScrollOffset;
   }
 
   touchLastX = x;
@@ -333,9 +346,25 @@ void processTouchPoint(uint16_t x, uint16_t y) {
   if (!swipeHandled && y < 280 && abs(dx) > 75 && abs(dy) < 28 && millis() - lastGestureMs > 320) {
     swipeHandled = true;
     lastGestureMs = millis();
+    screenScrollOffset = 0;
     currentScreen = dx < 0 ? (currentScreen + 1) % 5 : (currentScreen + 4) % 5;
     Serial.printf("[TOUCH] swipe -> screen %d\n", currentScreen);
     showCurrentScreen();
+    return;
+  }
+
+  if ((currentScreen == 1 || currentScreen == 2 || currentScreen == 3) && y < 280 && abs(dx) < 42 && abs(dy) > 16) {
+    int maxScroll = getMaxScrollForScreen();
+    if (maxScroll > 0) {
+      swipeHandled = true;
+      int newOffset = touchStartScrollOffset + ((int)touchStartY - (int)y);
+      if (newOffset < 0) newOffset = 0;
+      if (newOffset > maxScroll) newOffset = maxScroll;
+      if (newOffset != screenScrollOffset) {
+        screenScrollOffset = newOffset;
+        if (millis() - lastUiRefreshMs > 40) showCurrentScreen();
+      }
+    }
   }
 }
 
@@ -914,38 +943,41 @@ void drawWatchFace() {
 void drawHeartScreen() {
   gfx->fillScreen(C_BG);
   gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_GRAY);
-  drawCentered("Heart & Vitals", 18, C_RED, 2);
   drawSyncBadge(8, 12);
 
+  int yOff = -screenScrollOffset;
+  drawCentered("Heart & Vitals", 18 + yOff, C_RED, 2);
+
   int cx = SCREEN_W / 2;
-  gfx->fillCircle(cx, 80, 24, C_DKGRAY);
-  gfx->drawCircle(cx, 80, 27, C_RED);
-  drawHeartGlyph(cx, 82, C_RED);
+  gfx->fillCircle(cx, 80 + yOff, 24, C_DKGRAY);
+  gfx->drawCircle(cx, 80 + yOff, 27, C_RED);
+  drawHeartGlyph(cx, 82 + yOff, C_RED);
 
   char buf[8];
   snprintf(buf, sizeof(buf), "%d", heartRate);
-  drawCentered(buf, 114, C_WHITE, 5);
-  drawCentered("BPM", 164, C_LGRAY, 2);
+  drawCentered(buf, 114 + yOff, C_WHITE, 5);
+  drawCentered("BPM", 164 + yOff, C_LGRAY, 2);
 
-  gfx->fillRoundRect(18, 196, 60, 34, 8, C_DKGRAY);
-  gfx->drawRoundRect(18, 196, 60, 34, 8, C_BLUE);
-  drawDropGlyph(30, 212, C_BLUE);
+  gfx->fillRoundRect(18, 196 + yOff, 60, 34, 8, C_DKGRAY);
+  gfx->drawRoundRect(18, 196 + yOff, 60, 34, 8, C_BLUE);
+  drawDropGlyph(30, 212 + yOff, C_BLUE);
   gfx->setTextSize(1);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(42, 207);
+  gfx->setCursor(42, 207 + yOff);
   gfx->print(spo2);
   gfx->print("%");
 
-  gfx->fillRoundRect(92, 196, 60, 34, 8, C_DKGRAY);
-  gfx->drawRoundRect(92, 196, 60, 34, 8, C_ORANGE);
-  drawTempGlyph(104, 202, C_ORANGE);
+  gfx->fillRoundRect(92, 196 + yOff, 60, 34, 8, C_DKGRAY);
+  gfx->drawRoundRect(92, 196 + yOff, 60, 34, 8, C_ORANGE);
+  drawTempGlyph(104, 202 + yOff, C_ORANGE);
   gfx->setTextSize(1);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(116, 207);
+  gfx->setCursor(116, 207 + yOff);
   gfx->print(String(temperatureF, 1));
   gfx->print("F");
 
-  drawCentered(heartRate > 100 ? "Elevated" : "Normal zone", 244, heartRate > 100 ? C_ORANGE : C_GREEN, 2);
+  drawCentered(heartRate > 100 ? "Elevated" : "Normal zone", 244 + yOff, heartRate > 100 ? C_ORANGE : C_GREEN, 2);
+  drawCentered(screenScrollOffset > 0 ? "Swipe down to top" : "Swipe up/down", 270, C_LGRAY, 1);
   drawNavBar();
   drawPopupIfVisible();
   Serial.println("[DRAW] Heart screen done.");
@@ -958,30 +990,33 @@ void drawHeartScreen() {
 void drawStepsScreen() {
   gfx->fillScreen(C_BG);
   gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_GRAY);
-  drawCentered("Activity", 18, C_GREEN, 2);
   drawSyncBadge(8, 12);
 
+  int yOff = -screenScrollOffset;
+  drawCentered("Activity", 18 + yOff, C_GREEN, 2);
+
   int cx = SCREEN_W / 2;
-  gfx->fillCircle(cx, 78, 24, C_DKGRAY);
-  gfx->drawCircle(cx, 78, 26, C_GREEN);
-  drawWalkGlyph(cx, 82, C_GREEN);
+  gfx->fillCircle(cx, 78 + yOff, 24, C_DKGRAY);
+  gfx->drawCircle(cx, 78 + yOff, 26, C_GREEN);
+  drawWalkGlyph(cx, 82 + yOff, C_GREEN);
 
   char stepBuf[16];
   snprintf(stepBuf, sizeof(stepBuf), "%d", steps);
-  drawCentered(stepBuf, 114, C_WHITE, 4);
-  drawCentered("steps today", 150, C_LGRAY, 1);
+  drawCentered(stepBuf, 114 + yOff, C_WHITE, 4);
+  drawCentered("steps today", 150 + yOff, C_LGRAY, 1);
 
   int pct = (steps * 100) / 10000;
   if (pct > 100) pct = 100;
-  int bx = 15, by = 178, bw = SCREEN_W - 30;
+  int bx = 15, by = 178 + yOff, bw = SCREEN_W - 30;
   gfx->fillRoundRect(bx, by, bw, 12, 6, C_DKGRAY);
   gfx->fillRoundRect(bx, by, bw * pct / 100, 12, 6, C_GREEN);
 
   char pctBuf[8];
   snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
-  drawCentered(pctBuf, 202, C_GREEN, 2);
-  drawCentered("Goal 10,000", 226, C_LGRAY, 1);
-  drawCentered(imuReady ? "IMU tracking live" : "IMU offline", 246, imuReady ? C_ACCENT : C_RED, 1);
+  drawCentered(pctBuf, 202 + yOff, C_GREEN, 2);
+  drawCentered("Goal 10,000", 226 + yOff, C_LGRAY, 1);
+  drawCentered(imuReady ? "IMU tracking live" : "IMU offline", 246 + yOff, imuReady ? C_ACCENT : C_RED, 1);
+  drawCentered(screenScrollOffset > 0 ? "Swipe down to top" : "Swipe up/down", 270, C_LGRAY, 1);
 
   drawNavBar();
   drawPopupIfVisible();
@@ -995,14 +1030,16 @@ void drawStepsScreen() {
 void drawPatientScreen() {
   gfx->fillScreen(C_BG);
   gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_GRAY);
-  drawCentered("Patient Details", 16, C_BLUE, 2);
   drawSyncBadge(8, 12);
 
+  int yOff = -screenScrollOffset;
+  drawCentered("Patient Details", 16 + yOff, C_BLUE, 2);
+
   if (!patientLinked) {
-    drawCentered("No patient assigned", 82, C_WHITE, 2);
-    drawCentered("Link this watch in admin", 118, C_LGRAY, 1);
-    drawCentered(deviceId.c_str(), 150, C_ACCENT, 1);
-    drawCentered("Patients tab -> Device ID", 176, C_LGRAY, 1);
+    drawCentered("No patient assigned", 82 + yOff, C_WHITE, 2);
+    drawCentered("Link this watch in admin", 118 + yOff, C_LGRAY, 1);
+    drawCentered(deviceId.c_str(), 150 + yOff, C_ACCENT, 1);
+    drawCentered("Patients tab -> Device ID", 176 + yOff, C_LGRAY, 1);
   } else {
     String ageText = "Age " + String(linkedPatientAge);
     String riskText = "Risk: " + linkedPatientRisk;
@@ -1011,14 +1048,15 @@ void drawPatientScreen() {
     String vitalsText = "HR " + String(heartRate) + "  SpO2 " + String(spo2) + "%";
     String tempText = "Temp " + String(temperatureF, 1) + "F  Steps " + String(steps);
 
-    drawCentered(linkedPatientName.c_str(), 56, C_WHITE, 2);
-    drawCentered(ageText.c_str(), 82, C_ACCENT, 1);
-    drawCentered(riskText.c_str(), 104, linkedPatientRisk == "Critical" ? C_RED : C_GREEN, 1);
-    drawCentered(condText.c_str(), 128, C_LGRAY, 1);
-    drawCentered(vitalsText.c_str(), 164, C_WHITE, 1);
-    drawCentered(tempText.c_str(), 184, C_WHITE, 1);
-    drawCentered(noteText.length() > 0 ? noteText.c_str() : "No notes", 214, C_LGRAY, 1);
-    drawCentered(deviceId.c_str(), 242, C_BLUE, 1);
+    drawCentered(linkedPatientName.c_str(), 56 + yOff, C_WHITE, 2);
+    drawCentered(ageText.c_str(), 82 + yOff, C_ACCENT, 1);
+    drawCentered(riskText.c_str(), 104 + yOff, linkedPatientRisk == "Critical" ? C_RED : C_GREEN, 1);
+    drawCentered(condText.c_str(), 128 + yOff, C_LGRAY, 1);
+    drawCentered(vitalsText.c_str(), 164 + yOff, C_WHITE, 1);
+    drawCentered(tempText.c_str(), 184 + yOff, C_WHITE, 1);
+    drawCentered(noteText.length() > 0 ? noteText.c_str() : "No notes", 214 + yOff, C_LGRAY, 1);
+    drawCentered(deviceId.c_str(), 242 + yOff, C_BLUE, 1);
+    drawCentered("Swipe up/down for more", 270, C_LGRAY, 1);
   }
 
   drawNavBar();
