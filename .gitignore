@@ -1,0 +1,35 @@
+# OS / Editor
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+*.log
+
+# Environment / local config
+.env
+.env.*
+
+# Flutter / Dart generated files
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/build/
+**/android/local.properties
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/Generated.xcconfig
+**/macos/Flutter/ephemeral/
+**/windows/flutter/ephemeral/
+**/linux/flutter/ephemeral/
+
+# Arduino / build outputs
+*.bin
+*.elf
+*.map
+*.bak
+*.bak2
+
+# Vendor demo assets not needed in main repo
+WaveshareDemo/
+WaveshareDemo.zip
