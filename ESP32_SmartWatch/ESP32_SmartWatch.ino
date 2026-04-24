@@ -1,10 +1,11 @@
 // ============================================================================
-// ESP32-S3 Smart Watch — v3 with WiFi, QMI8658 Six-Axis Sensor, and SOS
+// ESP32-S3 Smart Watch — v3 with WiFi, QMI8658 Six-Axis Sensor, MPU6050, and SOS
 //
 // Hardware: Waveshare ESP32-S3-LCD-1.9 (170x320 ST7789, QMI8658 IMU)
 // Features:
-//   - 4 screens: Watch Face, Heart Rate, Activity/Steps, SOS
-//   - QMI8658 six-axis IMU for step counting & motion detection
+//   - 5 screens: Watch Face, Heart Rate, Activity/Steps, Patient, SOS
+//   - QMI8658 six-axis IMU (built-in) for step counting & motion detection
+//   - MPU6050 external IMU (breadboard) for pitch/roll orientation display
 //   - CST816 touchscreen navigation + BOOT fallback
 //   - WiFi HTTP POST to Supabase for SOS emergency alerts
 // ============================================================================
@@ -79,6 +80,19 @@ bool patientLinked = false;
 #define QMI8658_RESET   0x60    // Soft reset register
 #define QMI8658_AX_L    0x35    // Accel X low byte
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MPU6050 External IMU (I2C 0x68 — AD0 tied to GND)
+// Wired externally via breadboard on GPIO47(SDA)/GPIO48(SCL)
+// No address conflict with QMI8658 (0x6B)
+// ═══════════════════════════════════════════════════════════════════════════
+// MPU6050_ADDR is detected at runtime (AD0=GND → 0x68, AD0=float → 0x69)
+uint8_t MPU6050_ADDR     = 0x68;  // overwritten by mpu6050_init() if needed
+#define MPU6050_WHO_AM_I   0x75   // Returns 0x68 on genuine chip
+#define MPU6050_PWR_MGMT   0x6B   // Write 0x00 to wake from sleep
+#define MPU6050_GYRO_CFG   0x1B   // 0x00 = ±250 dps
+#define MPU6050_ACCEL_CFG  0x1C   // 0x00 = ±2 g (16384 LSB/g)
+#define MPU6050_DATA_START 0x3B   // First of 14-byte accel+temp+gyro block
+
 // ─── Watch State ───────────────────────────────────────────────────────────
 int heartRate = 72;
 int spo2 = 97;
@@ -126,6 +140,12 @@ unsigned long lastStepTime = 0;
 int16_t accelX = 0, accelY = 0, accelZ = 0;
 int16_t gyroX = 0, gyroY = 0, gyroZ = 0;
 int16_t prevAccelX = 0, prevAccelY = 0, prevAccelZ = 0;
+
+// ─── MPU6050 State ─────────────────────────────────────────────────────────
+bool    mpu6050Ready = false;
+int16_t mpuAccX = 0, mpuAccY = 0, mpuAccZ = 0;
+int16_t mpuGyroX = 0, mpuGyroY = 0, mpuGyroZ = 0;
+float   mpuPitch = 0.0f, mpuRoll = 0.0f;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // QMI8658 IMU Functions
@@ -206,6 +226,84 @@ void qmi8658_readGyro(int16_t &gx, int16_t &gy, int16_t &gz) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MPU6050 External IMU Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+void mpu6050_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+uint8_t mpu6050_readReg(uint8_t reg) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
+bool mpu6050_init() {
+  // Wire is already started by QMI8658 init.
+  // Auto-detect: try 0x68 (AD0=GND) then 0x69 (AD0=floating/HIGH)
+  bool found = false;
+  for (uint8_t candidate : {(uint8_t)0x68, (uint8_t)0x69}) {
+    Wire.beginTransmission(candidate);
+    if (Wire.endTransmission() == 0) {
+      MPU6050_ADDR = candidate;
+      found = true;
+      Serial.printf("[MPU6050] Found at I2C address 0x%02X%s\n", candidate,
+        candidate == 0x69 ? " (AD0 not grounded — wire AD0 to GND for 0x68)" : "");
+      break;
+    }
+  }
+  if (!found) {
+    Serial.println("[MPU6050] Not found on I2C bus at 0x68 or 0x69.");
+    return false;
+  }
+
+  uint8_t id = mpu6050_readReg(MPU6050_WHO_AM_I);
+  Serial.printf("[MPU6050] WHO_AM_I: 0x%02X (expected 0x68)\n", id);
+  if (id != 0x68) {
+    Serial.println("[MPU6050] Wrong chip ID — aborting.");
+    return false;
+  }
+
+  mpu6050_write(MPU6050_PWR_MGMT,  0x00);  // Wake from sleep
+  delay(10);
+  mpu6050_write(MPU6050_GYRO_CFG,  0x00);  // ±250 dps
+  mpu6050_write(MPU6050_ACCEL_CFG, 0x00);  // ±2 g (16384 LSB/g)
+  delay(10);
+  Serial.println("[MPU6050] Ready — Accel ±2g, Gyro ±250 dps");
+  return true;
+}
+
+void mpu6050_readAll() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(MPU6050_DATA_START);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14);
+
+  if (Wire.available() >= 14) {
+    mpuAccX  = (int16_t)((Wire.read() << 8) | Wire.read());
+    mpuAccY  = (int16_t)((Wire.read() << 8) | Wire.read());
+    mpuAccZ  = (int16_t)((Wire.read() << 8) | Wire.read());
+    Wire.read(); Wire.read();  // Skip temperature bytes
+    mpuGyroX = (int16_t)((Wire.read() << 8) | Wire.read());
+    mpuGyroY = (int16_t)((Wire.read() << 8) | Wire.read());
+    mpuGyroZ = (int16_t)((Wire.read() << 8) | Wire.read());
+
+    // Compute pitch and roll in degrees from accelerometer (±2g, 16384 LSB/g)
+    float ax = mpuAccX / 16384.0f;
+    float ay = mpuAccY / 16384.0f;
+    float az = mpuAccZ / 16384.0f;
+    mpuPitch = atan2f(ay, sqrtf(ax * ax + az * az)) * 57.2958f;
+    mpuRoll  = atan2f(-ax, az) * 57.2958f;
+  }
+}
+
 void initUniqueDeviceId() {
   uint64_t chipId = ESP.getEfuseMac();
   char idBuf[24];
@@ -281,7 +379,7 @@ bool getTouchXY(uint16_t &tx, uint16_t &ty) {
 int getMaxScrollForScreen() {
   switch (currentScreen) {
     case 1: return 34;
-    case 2: return 24;
+    case 2: return 44;
     case 3: return 92;
     default: return 0;
   }
@@ -1015,8 +1113,27 @@ void drawStepsScreen() {
   snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
   drawCentered(pctBuf, 202 + yOff, C_GREEN, 2);
   drawCentered("Goal 10,000", 226 + yOff, C_LGRAY, 1);
-  drawCentered(imuReady ? "IMU tracking live" : "IMU offline", 246 + yOff, imuReady ? C_ACCENT : C_RED, 1);
-  drawCentered(screenScrollOffset > 0 ? "Swipe down to top" : "Swipe up/down", 270, C_LGRAY, 1);
+
+  // IMU status row
+  {
+    String imuStr;
+    uint16_t imuCol;
+    if      (imuReady && mpu6050Ready) { imuStr = "QMI+MPU6050 active"; imuCol = C_ACCENT; }
+    else if (imuReady)                 { imuStr = "QMI tracking live";  imuCol = C_ACCENT; }
+    else if (mpu6050Ready)             { imuStr = "MPU6050 active";     imuCol = C_ACCENT; }
+    else                               { imuStr = "IMU offline";         imuCol = C_RED;    }
+    drawCentered(imuStr.c_str(), 246 + yOff, imuCol, 1);
+  }
+
+  // MPU6050 pitch / roll
+  if (mpu6050Ready) {
+    char prBuf[24];
+    snprintf(prBuf, sizeof(prBuf), "P:%.1f  R:%.1f", mpuPitch, mpuRoll);
+    drawCentered("MPU6050 Tilt", 260 + yOff, C_BLUE, 1);
+    drawCentered(prBuf, 272 + yOff, C_WHITE, 1);
+  }
+
+  drawCentered(screenScrollOffset > 0 ? "Swipe down to top" : "Swipe up/down", 283, C_LGRAY, 1);
 
   drawNavBar();
   drawPopupIfVisible();
@@ -1138,10 +1255,15 @@ void setup() {
     drawCentered("IMU Failed", 185, C_RED, 1);
   }
 
+  // Init MPU6050 external IMU
+  drawCentered("Starting MPU6050...", 200, C_LGRAY, 1);
+  mpu6050Ready = mpu6050_init();
+  drawCentered(mpu6050Ready ? "MPU6050 OK" : "MPU6050 N/A", 215, mpu6050Ready ? C_GREEN : C_GRAY, 1);
+
   // Init touch controller
-  drawCentered("Starting Touch...", 200, C_LGRAY, 1);
+  drawCentered("Starting Touch...", 230, C_LGRAY, 1);
   touchReady = touchInit();
-  drawCentered(touchReady ? "Touch+Swipe OK" : "Touch Failed", 215, touchReady ? C_GREEN : C_ORANGE, 1);
+  drawCentered(touchReady ? "Touch+Swipe OK" : "Touch Failed", 245, touchReady ? C_GREEN : C_ORANGE, 1);
 
   // Connect WiFi
   drawCentered("Connecting WiFi...", 230, C_LGRAY, 1);
@@ -1218,9 +1340,10 @@ void loop() {
   }
 
   // ── Read gyroscope every 100ms (for display on steps screen) ─────────────
-  if (imuReady && millis() - lastGyroRead >= 100) {
+  if (millis() - lastGyroRead >= 100) {
     lastGyroRead = millis();
-    qmi8658_readGyro(gyroX, gyroY, gyroZ);
+    if (imuReady)     qmi8658_readGyro(gyroX, gyroY, gyroZ);
+    if (mpu6050Ready) mpu6050_readAll();
   }
 
   // ── Update display every second ──────────────────────────────────────────
