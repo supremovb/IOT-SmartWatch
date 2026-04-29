@@ -21,6 +21,9 @@ class _PatientVitalsDialogState extends State<PatientVitalsDialog> {
   late int currentSpo2;
   late double currentTemp;
   late int currentSteps;
+  late double currentHumidity;
+  late int currentEco2;
+  late int currentTvoc;
   DateTime _capturedAt = DateTime.now();
   final List<FlSpot> _hrData = [];
   int xValue = 0;
@@ -32,6 +35,9 @@ class _PatientVitalsDialogState extends State<PatientVitalsDialog> {
     currentSpo2 = widget.patient.spo2;
     currentTemp = widget.patient.temperature;
     currentSteps = widget.patient.steps;
+    currentHumidity = widget.patient.humidity;
+    currentEco2 = widget.patient.eco2;
+    currentTvoc = widget.patient.tvoc;
 
     for (int i = 0; i < 15; i++) {
       _hrData.add(FlSpot(xValue.toDouble(), currentHeartRate.toDouble()));
@@ -54,6 +60,9 @@ class _PatientVitalsDialogState extends State<PatientVitalsDialog> {
       currentSpo2 = livePatient.spo2;
       currentTemp = livePatient.temperature;
       currentSteps = livePatient.steps;
+      currentHumidity = livePatient.humidity;
+      currentEco2 = livePatient.eco2;
+      currentTvoc = livePatient.tvoc;
       _capturedAt = DateTime.now();
       _hrData.add(FlSpot(xValue.toDouble(), currentHeartRate.toDouble()));
       if (_hrData.length > 15) {
@@ -129,6 +138,20 @@ class _PatientVitalsDialogState extends State<PatientVitalsDialog> {
                 _buildDialogVitalCard('Steps', '$currentSteps', Icons.directions_walk, AppColors.accent, false),
               ],
             ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                _buildDialogVitalCard('Humidity', '${currentHumidity.toStringAsFixed(1)}%', Icons.water, Colors.blue, false),
+                _buildDialogVitalCard('eCO2', '${currentEco2}ppm', Icons.air, currentEco2 > 1000 ? AppColors.warning : Colors.green, false),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                _buildDialogVitalCard('TVOC', '${currentTvoc}ppb', Icons.science, Colors.purple, false),
+                _buildDialogVitalCard('Air Quality', _aqiLabel(currentEco2), Icons.eco, _aqiColor(currentEco2), false),
+              ],
+            ),
           ],
         ),
       ),
@@ -139,6 +162,22 @@ class _PatientVitalsDialogState extends State<PatientVitalsDialog> {
         ),
       ],
     );
+  }
+
+  String _aqiLabel(int eco2) {
+    if (eco2 <= 600) return 'Excellent';
+    if (eco2 <= 1000) return 'Good';
+    if (eco2 <= 1500) return 'Moderate';
+    if (eco2 <= 2000) return 'Poor';
+    return 'Unhealthy';
+  }
+
+  Color _aqiColor(int eco2) {
+    if (eco2 <= 600) return Colors.green;
+    if (eco2 <= 1000) return Colors.lightGreen;
+    if (eco2 <= 1500) return Colors.orange;
+    if (eco2 <= 2000) return Colors.deepOrange;
+    return Colors.red;
   }
 
   Widget _buildDialogVitalCard(String title, String value, IconData icon, Color color, bool showChart) {

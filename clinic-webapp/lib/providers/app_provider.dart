@@ -125,6 +125,10 @@ class AppProvider extends ChangeNotifier {
       temperature: (row['temperature'] ?? 98.2).toDouble(),
       steps: row['steps'] ?? 0,
       notes: row['notes'] ?? '',
+      humidity: (row['humidity'] ?? 0).toDouble(),
+      eco2: row['eco2'] ?? 400,
+      tvoc: row['tvoc'] ?? 0,
+      ambientTemp: (row['ambient_temp'] ?? 0).toDouble(),
     )).toList();
   }
 
@@ -408,6 +412,10 @@ class AppProvider extends ChangeNotifier {
     temperature: (row['temperature'] ?? 98.2).toDouble(),
     steps: row['steps'] ?? 0,
     notes: row['notes'] ?? '',
+    humidity: (row['humidity'] ?? 0).toDouble(),
+    eco2: row['eco2'] ?? 400,
+    tvoc: row['tvoc'] ?? 0,
+    ambientTemp: (row['ambient_temp'] ?? 0).toDouble(),
   );
 
   AlertModel _alertFromRow(Map<String, dynamic> row) => AlertModel(
@@ -498,6 +506,24 @@ class AppProvider extends ChangeNotifier {
         title: 'Temperature warning',
         severity: 'warning',
         value: 'Temperature is ${patient.temperature.toStringAsFixed(1)}°F.',
+      );
+    }
+
+    if (patient.eco2 > 2000) {
+      _createAutoAlert(
+        patient,
+        keySuffix: 'co2-critical',
+        title: 'Dangerous CO2 level detected',
+        severity: 'critical',
+        value: 'eCO2 is ${patient.eco2} ppm — immediate ventilation needed.',
+      );
+    } else if (patient.eco2 > 1000) {
+      _createAutoAlert(
+        patient,
+        keySuffix: 'co2-warning',
+        title: 'Elevated CO2 warning',
+        severity: 'warning',
+        value: 'eCO2 is ${patient.eco2} ppm — consider ventilation.',
       );
     }
   }

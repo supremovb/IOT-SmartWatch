@@ -52,6 +52,10 @@ class DashboardScreen extends StatelessWidget {
                   const SizedBox(height: 16),
                   _buildVitalsGrid(context),
                   const SizedBox(height: 32),
+                  _buildSectionTitle(context, 'Air Quality & Environment'),
+                  const SizedBox(height: 16),
+                  _buildAirQualityGrid(context),
+                  const SizedBox(height: 32),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -315,6 +319,47 @@ class DashboardScreen extends StatelessWidget {
           )).toList(),
         );
       },
+    );
+  }
+
+  Widget _buildAirQualityGrid(BuildContext context) {
+    final appProvider = context.watch<AppProvider>();
+    final isMobile = MediaQuery.of(context).size.width < 768;
+
+    // Compute averages across online patients with device linked
+    final online = appProvider.patients.where((p) => p.deviceStatus == 'Online').toList();
+    final avgHumidity = online.isEmpty ? 0.0 : online.fold(0.0, (s, p) => s + p.humidity) / online.length;
+    final avgEco2     = online.isEmpty ? 400  : (online.fold(0, (s, p) => s + p.eco2) / online.length).round();
+    final avgTvoc     = online.isEmpty ? 0    : (online.fold(0, (s, p) => s + p.tvoc) / online.length).round();
+
+    String aqiLabel(int eco2) {
+      if (eco2 <= 600)  return 'Excellent';
+      if (eco2 <= 1000) return 'Good';
+      if (eco2 <= 1500) return 'Moderate';
+      if (eco2 <= 2000) return 'Poor';
+      return 'Unhealthy';
+    }
+    Color aqiColor(int eco2) {
+      if (eco2 <= 600)  return Colors.green;
+      if (eco2 <= 1000) return Colors.lightGreen;
+      if (eco2 <= 1500) return Colors.orange;
+      if (eco2 <= 2000) return Colors.deepOrange;
+      return Colors.red;
+    }
+
+    return GridView.count(
+      crossAxisCount: isMobile ? 2 : 4,
+      childAspectRatio: isMobile ? 1.5 : 1.8,
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      mainAxisSpacing: 16,
+      crossAxisSpacing: 16,
+      children: [
+        _buildVitalCard(context, 'Avg Humidity', '${avgHumidity.toStringAsFixed(1)}%', '30-60%', Colors.blue, Icons.water),
+        _buildVitalCard(context, 'Avg eCO2', '${avgEco2}ppm', '<1000 ppm', aqiColor(avgEco2), Icons.air),
+        _buildVitalCard(context, 'Avg TVOC', '${avgTvoc}ppb', '<500 ppb', Colors.purple, Icons.science),
+        _buildVitalCard(context, 'Air Quality', aqiLabel(avgEco2), 'Excellent-Good', aqiColor(avgEco2), Icons.eco),
+      ],
     );
   }
 

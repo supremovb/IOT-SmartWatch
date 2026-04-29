@@ -14,6 +14,8 @@ struct KnownDevice {
 };
 
 KnownDevice known[] = {
+  {0x38, "AHT21 (Humidity/Temperature)"},
+  {0x52, "ENS160 (CO2/TVOC Air Quality)"},
   {0x57, "MAX30102 (Heart Rate/SpO2)"},
   {0x5A, "MLX90614 (Body Temperature)"},
   {0x68, "MPU6050 (Accelerometer/Steps)"},
@@ -28,10 +30,25 @@ const char* getDeviceName(byte addr) {
   return "Unknown";
 }
 
+// Sends 9 SCL pulses to unstick any device holding SDA low
+void i2cBusRecover() {
+  pinMode(I2C_SDA, OUTPUT); digitalWrite(I2C_SDA, HIGH);
+  pinMode(I2C_SCL, OUTPUT); digitalWrite(I2C_SCL, HIGH);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(I2C_SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
+  }
+  // STOP condition
+  digitalWrite(I2C_SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(I2C_SDA, HIGH); delayMicroseconds(5);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
+
+  i2cBusRecover();
   Wire.begin(I2C_SDA, I2C_SCL);
   
   Serial.println("\n============================================");

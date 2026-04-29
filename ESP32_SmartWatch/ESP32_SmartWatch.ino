@@ -120,6 +120,7 @@ bool lastSyncOk = false;
 uint8_t touchGesture = 0;
 uint16_t touchStartX = 0, touchStartY = 0;
 uint16_t touchLastX = 0, touchLastY = 0;
+uint8_t touchNoContactCount = 0;  // consecutive no-touch polls before finalizing
 int lastRenderedMinute = -1;
 unsigned long lastUiRefreshMs = 0;
 String popupMessage = "";
@@ -147,6 +148,145 @@ int16_t mpuAccX = 0, mpuAccY = 0, mpuAccZ = 0;
 int16_t mpuGyroX = 0, mpuGyroY = 0, mpuGyroZ = 0;
 float   mpuPitch = 0.0f, mpuRoll = 0.0f;
 
+// ─── AHT21 Humidity + Temperature (I2C 0x38) ─────────────────────────────
+bool  aht21Ready    = false;
+float aht21Humidity = 0.0f;   // %RH
+float aht21AmbientC = 0.0f;   // °C
+
+// ─── ENS160 Air Quality (I2C 0x52) ──────────────────────────────────────
+bool     ens160Ready = false;
+uint16_t ens160Eco2  = 400;   // ppm
+uint16_t ens160Tvoc  = 0;     // ppb
+uint8_t  ens160Aqi   = 1;     // 1=Excellent 2=Good 3=Moderate 4=Poor 5=Unhealthy
+
+// ─── MLX90614 Contactless Temperature (I2C 0x5A) ────────────────────────
+bool  mlx90614Ready = false;
+float bodyTempF     = 98.4f;  // object (body) temperature °F
+float mlxAmbientF   = 0.0f;   // ambient temperature °F
+unsigned long lastSensorReadMs = 0;
+
+// AHT21 non-blocking state
+bool          aht21Triggered  = false;
+unsigned long aht21TriggerMs  = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AHT21 Humidity + Temperature Sensor
+// ═══════════════════════════════════════════════════════════════════════════
+#define AHT21_ADDR 0x38
+
+bool aht21_init() {
+  Wire.beginTransmission(AHT21_ADDR);
+  if (Wire.endTransmission() != 0) return false;
+  delay(40);
+  Wire.beginTransmission(AHT21_ADDR);
+  Wire.write(0xBE); Wire.write(0x08); Wire.write(0x00);
+  Wire.endTransmission();
+  delay(10);
+  return true;
+}
+
+// Send measurement trigger — call this, then wait >= 80ms before aht21_fetch()
+void aht21_trigger() {
+  Wire.beginTransmission(AHT21_ADDR);
+  Wire.write(0xAC); Wire.write(0x33); Wire.write(0x00);
+  Wire.endTransmission();
+}
+
+// Read result — only call >= 80ms after aht21_trigger()
+bool aht21_fetch(float &humidity, float &tempC) {
+  Wire.requestFrom((uint8_t)AHT21_ADDR, (uint8_t)6);
+  if (Wire.available() < 6) return false;
+  uint8_t buf[6];
+  for (int i = 0; i < 6; i++) buf[i] = Wire.read();
+  if (buf[0] & 0x80) return false; // busy
+  uint32_t rawHum  = ((uint32_t)buf[1] << 12) | ((uint32_t)buf[2] << 4) | (buf[3] >> 4);
+  uint32_t rawTemp = ((uint32_t)(buf[3] & 0x0F) << 16) | ((uint32_t)buf[4] << 8) | buf[5];
+  humidity = rawHum  / 1048576.0f * 100.0f;
+  tempC    = rawTemp / 1048576.0f * 200.0f - 50.0f;
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENS160 Air Quality Sensor (eCO2, TVOC, AQI)
+// ═══════════════════════════════════════════════════════════════════════════
+#define ENS160_ADDR        0x52
+#define ENS160_REG_OPMODE  0x10
+#define ENS160_REG_DSTATUS 0x20
+#define ENS160_REG_STATUS  0x40
+#define ENS160_REG_AQI     0x41
+#define ENS160_REG_TVOC    0x42
+#define ENS160_REG_ECO2    0x44
+
+void ens160_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(ENS160_ADDR);
+  Wire.write(reg); Wire.write(val);
+  Wire.endTransmission();
+}
+
+uint8_t ens160_read1(uint8_t reg) {
+  Wire.beginTransmission(ENS160_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)ENS160_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0;
+}
+
+uint16_t ens160_read2(uint8_t reg) {
+  Wire.beginTransmission(ENS160_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)ENS160_ADDR, (uint8_t)2);
+  if (Wire.available() < 2) return 0;
+  uint8_t lo = Wire.read(), hi = Wire.read();
+  return ((uint16_t)hi << 8) | lo;
+}
+
+bool ens160_init() {
+  Wire.beginTransmission(ENS160_ADDR);
+  if (Wire.endTransmission() != 0) return false;
+  ens160_write(ENS160_REG_OPMODE, 0xF0); // Reset
+  delay(20);
+  ens160_write(ENS160_REG_OPMODE, 0x02); // Standard mode
+  delay(50);
+  return true;
+}
+
+bool ens160_read(uint16_t &eco2, uint16_t &tvoc, uint8_t &aqi) {
+  uint8_t status = ens160_read1(ENS160_REG_STATUS);
+  if (!(status & 0x02)) return false; // no new data
+  aqi  = ens160_read1(ENS160_REG_AQI) & 0x07;
+  tvoc = ens160_read2(ENS160_REG_TVOC);
+  eco2 = ens160_read2(ENS160_REG_ECO2);
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MLX90614 Contactless Temperature Sensor
+// ═══════════════════════════════════════════════════════════════════════════
+#define MLX90614_ADDR  0x5A
+#define MLX_REG_TOBJ   0x07  // Object (body) temperature
+#define MLX_REG_TAMB   0x06  // Ambient temperature
+
+bool mlx90614_init() {
+  Wire.beginTransmission(MLX90614_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+float mlx90614_readTempF(uint8_t reg) {
+  Wire.beginTransmission(MLX90614_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MLX90614_ADDR, (uint8_t)3);
+  if (Wire.available() < 3) return -999.0f;
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  Wire.read(); // PEC byte
+  uint16_t raw = ((uint16_t)hi << 8) | lo;
+  if (raw & 0x8000) return -999.0f; // error flag
+  float tempC = raw * 0.02f - 273.15f;
+  return tempC * 9.0f / 5.0f + 32.0f;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // QMI8658 IMU Functions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -167,12 +307,11 @@ uint8_t qmi8658_read(uint8_t reg) {
 }
 
 bool qmi8658_init() {
-  Wire.begin(IMU_SDA, IMU_SCL);
-  delay(10);
+  // Wire already started in setup() — do NOT call Wire.begin() again here
 
-  // Soft reset
+  // Soft reset — QMI8658 needs at least 50ms after reset before it responds
   qmi8658_write(QMI8658_RESET, 0xB0);
-  delay(20);
+  delay(100);
 
   // Verify chip ID
   uint8_t id = qmi8658_read(QMI8658_WHO_AM_I);
@@ -324,19 +463,41 @@ void pushPopup(const String &message, uint16_t color, unsigned long durationMs =
 // ═══════════════════════════════════════════════════════════════════════════
 #define TOUCH_ADDR 0x15
 
+// i2cBusRecover() is now only called at the top of setup(), before Wire.begin().
+// Do not call it after Wire is initialized — it is no longer needed mid-flight.
+
 bool touchInit() {
   pinMode(TP_INT, INPUT_PULLUP);
 
+  // The CST816 does NOT respond to a bare I2C address probe.
+  // Correct method (matches official Waveshare FT3168 demo):
+  // Write 0x00 to register 0x00 (normal mode), then verify by reading chip ID.
   Wire.beginTransmission(TOUCH_ADDR);
-  if (Wire.endTransmission() != 0) {
-    Serial.println("[TOUCH] CST816 not found.");
+  Wire.write(0x00);  // register address
+  Wire.write(0x00);  // value: normal mode
+  uint8_t writeErr = Wire.endTransmission();
+
+  if (writeErr != 0) {
+    // Retry once after a short pause
+    delay(30);
+    Wire.beginTransmission(TOUCH_ADDR);
+    Wire.write(0x00);
+    Wire.write(0x00);
+    writeErr = Wire.endTransmission();
+  }
+
+  if (writeErr != 0) {
+    Serial.printf("[TOUCH] CST816 write failed (err=%d). Touch disabled.\n", writeErr);
     return false;
   }
 
+  // Read chip ID register 0xA7 to confirm it's really there
   Wire.beginTransmission(TOUCH_ADDR);
-  Wire.write(0x00);
-  Wire.write(0x00);  // normal mode
-  Wire.endTransmission();
+  Wire.write(0xA7);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)TOUCH_ADDR, (uint8_t)1);
+  uint8_t chipId = Wire.available() ? Wire.read() : 0;
+  Serial.printf("[TOUCH] CST816 chip ID: 0x%02X (write err=%d)\n", chipId, writeErr);
 
   Serial.println("[TOUCH] CST816 ready.");
   return true;
@@ -475,6 +636,7 @@ void finalizeTouch() {
 
   touchTracking = false;
   swipeHandled = false;
+  touchNoContactCount = 0;
 }
 
 void calibrateMotionBaseline() {
@@ -505,10 +667,55 @@ void updateLiveMetrics() {
   if (spo2 < 95) spo2 = 95;
   if (spo2 > 100) spo2 = 100;
 
-  temperatureF = 98.4f + 0.25f * sin(millis() / 9000.0f);
+  // Use real MLX90614 body temperature if available, otherwise fallback
+  if (!mlx90614Ready) {
+    temperatureF = 98.4f + 0.25f * sin(millis() / 9000.0f);
+  }
 
   int liveBattery = 87 - (int)(millis() / 300000UL);
   battery = liveBattery < 15 ? 15 : liveBattery;
+}
+
+// Phase 1 — kick off slow sensors (call every 5s)
+void triggerSlowSensors() {
+  if (aht21Ready) {
+    aht21_trigger();
+    aht21TriggerMs = millis();
+    aht21Triggered = true;
+  }
+}
+
+// Phase 2 — collect results (call >= 100ms after triggerSlowSensors)
+void readAllSensors() {
+  // AHT21 — result available 80ms+ after trigger
+  if (aht21Ready && aht21Triggered && millis() - aht21TriggerMs >= 90) {
+    float h, t;
+    if (aht21_fetch(h, t)) {
+      aht21Humidity = h;
+      aht21AmbientC = t;
+    }
+    aht21Triggered = false;
+  }
+
+  // ENS160 — eCO2, TVOC, AQI (no blocking delay needed)
+  if (ens160Ready) {
+    uint16_t co2, voc;
+    uint8_t  aqi;
+    if (ens160_read(co2, voc, aqi)) {
+      ens160Eco2 = co2;
+      ens160Tvoc = voc;
+      ens160Aqi  = aqi;
+    }
+  }
+
+  // MLX90614 — body + ambient temperature (no blocking delay)
+  if (mlx90614Ready) {
+    float bt = mlx90614_readTempF(MLX_REG_TOBJ);
+    float at = mlx90614_readTempF(MLX_REG_TAMB);
+    if (bt > -900.0f && bt > 60.0f && bt < 120.0f) temperatureF = bt;
+    if (at > -900.0f) mlxAmbientF = at;
+    bodyTempF = temperatureF;
+  }
 }
 
 String currentTimestampText() {
@@ -730,7 +937,14 @@ void syncWatchToCloud() {
     String patientBody = "{";
     patientBody += "\"device_status\":\"Online\",";
     patientBody += "\"last_sync\":\"" + syncText + "\",";
-    patientBody += "\"steps\":" + String(steps);
+    patientBody += "\"heart_rate\":" + String(heartRate) + ",";
+    patientBody += "\"spo2\":" + String(spo2) + ",";
+    patientBody += "\"temperature\":" + String(temperatureF, 1) + ",";
+    patientBody += "\"steps\":" + String(steps) + ",";
+    patientBody += "\"humidity\":" + String(aht21Humidity, 1) + ",";
+    patientBody += "\"eco2\":" + String(ens160Eco2) + ",";
+    patientBody += "\"tvoc\":" + String(ens160Tvoc) + ",";
+    patientBody += "\"ambient_temp\":" + String(aht21AmbientC, 1);
     patientBody += "}";
     patientCode = patientHttp.sendRequest("PATCH", patientBody);
     patientHttp.end();
@@ -742,7 +956,7 @@ void syncWatchToCloud() {
   }
 
   maybeSendVitalAlerts();
-  Serial.printf("[SYNC] device=%s devices=%d patients=%d hr=%d spo2=%d temp=%.1f steps=%d ok=%d\n", deviceId.c_str(), deviceCode, patientCode, heartRate, spo2, temperatureF, steps, lastSyncOk);
+  Serial.printf("[SYNC] device=%s hr=%d spo2=%d temp=%.1f steps=%d hum=%.1f co2=%u tvoc=%u ok=%d\n", deviceId.c_str(), heartRate, spo2, temperatureF, steps, aht21Humidity, ens160Eco2, ens160Tvoc, lastSyncOk);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1125,11 +1339,23 @@ void drawStepsScreen() {
     drawCentered(imuStr.c_str(), 246 + yOff, imuCol, 1);
   }
 
+  // Air quality row (ENS160 + AHT21)
+  if (ens160Ready || aht21Ready) {
+    char airBuf[28];
+    if (ens160Ready && aht21Ready)
+      snprintf(airBuf, sizeof(airBuf), "CO2:%uppm H:%.0f%%", ens160Eco2, aht21Humidity);
+    else if (ens160Ready)
+      snprintf(airBuf, sizeof(airBuf), "CO2:%uppm TVOC:%uppb", ens160Eco2, ens160Tvoc);
+    else
+      snprintf(airBuf, sizeof(airBuf), "Humidity: %.1f%%", aht21Humidity);
+    uint16_t aqCol = (ens160Eco2 > 1500 || ens160Aqi >= 4) ? C_ORANGE : C_GREEN;
+    drawCentered(airBuf, 260 + yOff, aqCol, 1);
+  }
+
   // MPU6050 pitch / roll
   if (mpu6050Ready) {
     char prBuf[24];
     snprintf(prBuf, sizeof(prBuf), "P:%.1f  R:%.1f", mpuPitch, mpuRoll);
-    drawCentered("MPU6050 Tilt", 260 + yOff, C_BLUE, 1);
     drawCentered(prBuf, 272 + yOff, C_WHITE, 1);
   }
 
@@ -1227,8 +1453,45 @@ void drawSOSScreen() {
 
 void setup() {
   Serial.begin(115200);
+
+  // ── Wait 4s so you can open Serial Monitor before messages scroll past ─
+  for (int i = 4; i > 0; i--) {
+    Serial.printf("Starting in %d... (open Serial Monitor now)\n", i);
+    delay(1000);
+  }
   Serial.println("\n=== SMART WATCH v3.5 — Patient Sync + Alerts ===");
   initUniqueDeviceId();
+
+  // ── I2C bus recovery FIRST ─────────────────────────────────────────────
+  // Bit-bang 9 SCL pulses to force any stuck slave to release SDA,
+  // then hand pins back to Wire hardware driver.
+  Serial.println("[I2C] Running bus recovery...");
+  pinMode(IMU_SDA, INPUT_PULLUP);  // let SDA float up first
+  pinMode(IMU_SCL, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(IMU_SCL, LOW);  delayMicroseconds(10);
+    digitalWrite(IMU_SCL, HIGH); delayMicroseconds(10);
+    // If SDA is high, slave released — can stop early
+    if (digitalRead(IMU_SDA) == HIGH && i >= 1) break;
+  }
+  // STOP condition: SCL HIGH, SDA LOW->HIGH
+  pinMode(IMU_SDA, OUTPUT);
+  digitalWrite(IMU_SDA, LOW);  delayMicroseconds(10);
+  digitalWrite(IMU_SCL, HIGH); delayMicroseconds(10);
+  digitalWrite(IMU_SDA, HIGH); delayMicroseconds(10);
+  pinMode(IMU_SDA, INPUT_PULLUP);
+  delay(50);
+
+  // Now start Wire
+  Wire.begin(IMU_SDA, IMU_SCL);
+  Wire.setTimeOut(50);
+  delay(20);
+  bool sdaHigh = digitalRead(IMU_SDA);
+  bool sclHigh = digitalRead(IMU_SCL);
+  Serial.printf("[I2C] Bus state after recovery: SDA=%s SCL=%s\n",
+    sdaHigh ? "HIGH(OK)" : "LOW(STUCK!)",
+    sclHigh ? "HIGH(OK)" : "LOW(STUCK!)");
+  // ──────────────────────────────────────────────────────────────────────
 
   // Init display (before backlight, like Waveshare demo)
   if (!gfx->begin()) {
@@ -1245,6 +1508,41 @@ void setup() {
   drawCentered("Smart Watch v3", 100, C_WHITE, 2);
   drawCentered("Initializing...", 140, C_ACCENT, 1);
 
+  // ── I2C bus scan ───────────────────────────────────────────────────────
+  struct { byte addr; const char* name; } knownDevices[] = {
+    {0x15, "CST816 Touch"},
+    {0x38, "AHT21 Humidity"},
+    {0x52, "ENS160 Air Quality"},
+    {0x57, "MAX30102 Heart Rate"},
+    {0x5A, "MLX90614 Temperature"},
+    {0x68, "MPU6050 IMU"},
+    {0x6B, "QMI8658 Onboard IMU"},
+  };
+  const int knownCount = sizeof(knownDevices) / sizeof(knownDevices[0]);
+
+  Serial.println("\n--- I2C Bus Scan ---");
+  Serial.println("ADDR  | STATUS | DEVICE");
+  Serial.println("------+--------+---------------------------");
+  int foundCount = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      const char* label = "Unknown";
+      for (int k = 0; k < knownCount; k++) {
+        if (knownDevices[k].addr == addr) { label = knownDevices[k].name; break; }
+      }
+      Serial.printf("0x%02X  |  FOUND | %s\n", addr, label);
+      foundCount++;
+    }
+  }
+  Serial.println("------+--------+---------------------------");
+  Serial.printf("Total: %d device(s) found\n\n", foundCount);
+  if (foundCount == 0) {
+    Serial.println("!!! NO DEVICES FOUND — I2C bus is stuck or wiring error !!!");
+    Serial.println("    Check: SDA=GPIO47, SCL=GPIO48, 3.3V power to sensors");
+  }
+  // ──────────────────────────────────────────────────────────────────────
+
   // Init QMI8658 six-axis sensor
   drawCentered("Starting IMU...", 170, C_LGRAY, 1);
   imuReady = qmi8658_init();
@@ -1259,6 +1557,29 @@ void setup() {
   drawCentered("Starting MPU6050...", 200, C_LGRAY, 1);
   mpu6050Ready = mpu6050_init();
   drawCentered(mpu6050Ready ? "MPU6050 OK" : "MPU6050 N/A", 215, mpu6050Ready ? C_GREEN : C_GRAY, 1);
+
+  // Init MLX90614 contactless temperature
+  drawCentered("Starting MLX90614...", 200, C_LGRAY, 1);
+  mlx90614Ready = mlx90614_init();
+  Serial.printf("[MLX90614] %s\n", mlx90614Ready ? "Ready" : "Not found (N/A)");
+  drawCentered(mlx90614Ready ? "MLX90614 OK" : "MLX90614 N/A", 215, mlx90614Ready ? C_GREEN : C_GRAY, 1);
+
+  // Init AHT21 humidity sensor
+  drawCentered("Starting AHT21...", 200, C_LGRAY, 1);
+  aht21Ready = aht21_init();
+  Serial.printf("[AHT21] %s\n", aht21Ready ? "Ready" : "Not found (N/A)");
+  drawCentered(aht21Ready ? "AHT21 OK" : "AHT21 N/A", 215, aht21Ready ? C_GREEN : C_GRAY, 1);
+
+  // Init ENS160 air quality sensor
+  drawCentered("Starting ENS160...", 200, C_LGRAY, 1);
+  ens160Ready = ens160_init();
+  Serial.printf("[ENS160] %s\n", ens160Ready ? "Ready" : "Not found (N/A)");
+  drawCentered(ens160Ready ? "ENS160 OK" : "ENS160 N/A", 215, ens160Ready ? C_GREEN : C_GRAY, 1);
+
+  // Initial sensor read (blocking is fine here in setup)
+  triggerSlowSensors();
+  delay(100);
+  readAllSensors();
 
   // Init touch controller
   drawCentered("Starting Touch...", 230, C_LGRAY, 1);
@@ -1320,16 +1641,50 @@ void loop() {
   }
   lastBtn = b;
 
-  // ── Touch handling with tap + swipe ──────────────────────────────────────
+  // ── Touch handling — poll FT3168 directly every 25ms (no TP_INT dependency) ──
   if (touchReady && millis() - lastTouchMs > 25) {
     lastTouchMs = millis();
     uint16_t tx, ty;
-    if (digitalRead(TP_INT) == LOW) {
-      if (getTouchXY(tx, ty)) {
-        processTouchPoint(tx, ty);
-      }
+    bool touched = getTouchXY(tx, ty);
+    if (touched) {
+      touchNoContactCount = 0;
+      processTouchPoint(tx, ty);
     } else if (touchTracking) {
-      finalizeTouch();
+      touchNoContactCount++;
+      if (touchNoContactCount >= 2) {  // 2 consecutive no-touch polls (~50ms) = release
+        touchNoContactCount = 0;
+        finalizeTouch();
+      }
+    }
+  }
+
+  // ── I2C bus health check every 30s — recover if SDA is stuck LOW ────────
+  static unsigned long lastBusCheckMs = 0;
+  if (millis() - lastBusCheckMs >= 30000) {
+    lastBusCheckMs = millis();
+    if (digitalRead(IMU_SDA) == LOW) {
+      Serial.println("[I2C] SDA stuck LOW detected — running bus recovery...");
+      // Bit-bang 9 SCL pulses to release stuck slave
+      pinMode(IMU_SDA, INPUT_PULLUP);
+      pinMode(IMU_SCL, OUTPUT);
+      for (int i = 0; i < 9; i++) {
+        digitalWrite(IMU_SCL, LOW);  delayMicroseconds(10);
+        digitalWrite(IMU_SCL, HIGH); delayMicroseconds(10);
+      }
+      pinMode(IMU_SDA, OUTPUT);
+      digitalWrite(IMU_SDA, LOW);  delayMicroseconds(10);
+      digitalWrite(IMU_SCL, HIGH); delayMicroseconds(10);
+      digitalWrite(IMU_SDA, HIGH); delayMicroseconds(10);
+      Wire.begin(IMU_SDA, IMU_SCL);
+      Wire.setTimeOut(50);
+      delay(20);
+      // Re-init any sensors that went offline
+      if (!imuReady)      { imuReady      = qmi8658_init(); Serial.printf("[I2C] QMI re-init: %s\n", imuReady ? "OK" : "fail"); }
+      if (!mpu6050Ready)  { mpu6050Ready  = mpu6050_init(); Serial.printf("[I2C] MPU re-init: %s\n", mpu6050Ready ? "OK" : "fail"); }
+      if (!aht21Ready)    { aht21Ready    = aht21_init();   Serial.printf("[I2C] AHT21 re-init: %s\n", aht21Ready ? "OK" : "fail"); }
+      if (!ens160Ready)   { ens160Ready   = ens160_init();  Serial.printf("[I2C] ENS160 re-init: %s\n", ens160Ready ? "OK" : "fail"); }
+      if (!mlx90614Ready) { mlx90614Ready = mlx90614_init();Serial.printf("[I2C] MLX re-init: %s\n", mlx90614Ready ? "OK" : "fail"); }
+      if (!touchReady)    { touchReady    = touchInit();    Serial.printf("[I2C] Touch re-init: %s\n", touchReady ? "OK" : "fail"); }
     }
   }
 
@@ -1344,6 +1699,16 @@ void loop() {
     lastGyroRead = millis();
     if (imuReady)     qmi8658_readGyro(gyroX, gyroY, gyroZ);
     if (mpu6050Ready) mpu6050_readAll();
+  }
+
+  // ── Read AHT21, ENS160, MLX90614 every 5 seconds (non-blocking) ─────────
+  if (millis() - lastSensorReadMs >= 5000) {
+    lastSensorReadMs = millis();
+    triggerSlowSensors();  // Phase 1: kick off AHT21 measurement
+  }
+  // Phase 2: collect AHT21 + other sensor results 100ms after trigger
+  if (aht21Triggered && millis() - aht21TriggerMs >= 100) {
+    readAllSensors();
   }
 
   // ── Update display every second ──────────────────────────────────────────
