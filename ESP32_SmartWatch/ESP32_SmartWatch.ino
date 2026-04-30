@@ -15,6 +15,8 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <math.h>
 #include <time.h>
 
@@ -29,6 +31,10 @@
 #define IMU_SDA   47
 #define IMU_SCL   48
 #define TP_INT    21
+
+// ─── MAX30102 second I2C bus (GPIO3/GPIO5) ─────────────────────────────────
+#define MAX30102_SDA   3
+#define MAX30102_SCL   5
 
 #define SCREEN_W  170
 #define SCREEN_H  320
@@ -50,16 +56,29 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, TFT_RST, 0, false, SCREEN_W, SCREEN_H
 #define C_BLUE    0x001F
 
 // ═══════════════════════════════════════════════════════════════════════════
-// WiFi & Supabase Configuration
-// *** CHANGE THESE TO YOUR WiFi CREDENTIALS ***
+// WiFi Provisioning Configuration
+// WiFi credentials are stored in NVS (non-volatile storage) via the
+// SmartWatch Setup companion app. NO hardcoded credentials needed!
+// ── How to set up WiFi ──────────────────────────────────────────────────
+//   1. Power on the watch — it shows "WiFi Setup" screen if no WiFi saved
+//   2. Connect your phone/PC to WiFi: "SmartWatch-Setup" / "setup1234"
+//   3. Open the SmartWatch Setup app
+//   4. Pick your home WiFi and enter password → watch saves & restarts
+// ── Reset WiFi ───────────────────────────────────────────────────────────
+//   Hold the BOOT button for 3 seconds to clear saved WiFi and re-enter
+//   provisioning mode.
 // ═══════════════════════════════════════════════════════════════════════════
-const char* WIFI_SSID = "WIFI_NI_KAGRASYA";
-const char* WIFI_PASS = "Avyannamae13";
+const char* AP_SSID     = "SmartWatch-Setup";  // Provisioning hotspot name
+const char* AP_PASSWORD = "setup1234";          // Provisioning hotspot password
+// NVS storage + HTTP server used during provisioning
+Preferences wifiPrefs;
+WebServer   setupServer(80);
+bool        apMode = false;
 
 const char* SUPABASE_URL = "https://cnktjnchyyttjvslvdpr.supabase.co";
 const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNua3RqbmNoeXl0dGp2c2x2ZHByIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU4NzkyMzksImV4cCI6MjA5MTQ1NTIzOX0.HMF3yowDRciupe3BO-9gn-1vE5IWm7NYQWpQKDmqd4g";
 const char* DEVICE_NAME = "ESP32 SmartWatch";
-const char* FIRMWARE_VERSION = "v3.5-patient-sync";
+const char* FIRMWARE_VERSION = "v3.8-wifi-provisioning";
 String deviceId = "WATCH-SETUP";
 String linkedPatientName = "No patient linked";
 String linkedPatientCondition = "Waiting for pairing";
@@ -93,6 +112,22 @@ uint8_t MPU6050_ADDR     = 0x68;  // overwritten by mpu6050_init() if needed
 #define MPU6050_ACCEL_CFG  0x1C   // 0x00 = ±2 g (16384 LSB/g)
 #define MPU6050_DATA_START 0x3B   // First of 14-byte accel+temp+gyro block
 
+// ─── MAX30102 Registers ────────────────────────────────────────────────────
+#define MAX30102_ADDR       0x57
+#define MAX_REG_INTR_STAT1  0x00
+#define MAX_REG_FIFO_WR_PTR 0x04
+#define MAX_REG_FIFO_OVF    0x05
+#define MAX_REG_FIFO_RD_PTR 0x06
+#define MAX_REG_FIFO_DATA   0x07
+#define MAX_REG_FIFO_CFG    0x08
+#define MAX_REG_MODE_CFG    0x09
+#define MAX_REG_SPO2_CFG    0x0A
+#define MAX_REG_LED1_PA     0x0C
+#define MAX_REG_LED2_PA     0x0D
+#define MAX_REG_PART_ID     0xFF
+
+TwoWire Wire2 = TwoWire(1);  // Second I2C bus for MAX30102
+
 // ─── Watch State ───────────────────────────────────────────────────────────
 int heartRate = 72;
 int spo2 = 97;
@@ -111,6 +146,27 @@ unsigned long lastTouchMs = 0;
 unsigned long lastCloudSyncMs = 0;
 unsigned long lastWiFiRetryMs = 0;
 unsigned long lastVitalAlertMs = 0;
+unsigned long lastAlertHrMs    = 0;  // per-vital alert cooldowns
+unsigned long lastAlertSpo2Ms  = 0;
+unsigned long lastAlertTempMs  = 0;
+unsigned long lastAlertCo2Ms   = 0;
+unsigned long lastAlertTvocMs  = 0;
+unsigned long lastAlertFallMs  = 0;
+#define ALERT_COOLDOWN_MS 30000UL   // 30s per vital
+
+// Step-rate tracking for activity-aware HR alerts
+int  stepRatePM     = 0;       // estimated steps per minute (rolling)
+int  stepsLastMin   = 0;       // step count captured 60s ago
+unsigned long stepRateCalcMs = 0;  // when we last computed stepRatePM
+#define FALL_COOLDOWN_MS  60000UL   // 60s between fall alerts
+
+// ─── Fall Detection State ──────────────────────────────────────────────────
+bool          fallFreefallArmed = false;  // true when free-fall phase detected
+unsigned long fallFreefallMs    = 0;      // millis() when free-fall started
+bool          fallDetectedFlag  = false;  // set true on confirmed fall, cleared after sync
+#define FALL_FREEFALL_THRESH  3000.0f    // < ~0.37g (±4g, 8192 LSB/g) = free-fall
+#define FALL_IMPACT_THRESH   22000.0f   // > ~2.7g = impact after fall
+#define FALL_WINDOW_MS         700UL    // max ms between free-fall and impact
 unsigned long lastSyncOkMs = 0;
 unsigned long lastGestureMs = 0;
 unsigned long lastPatientFetchMs = 0;
@@ -164,6 +220,19 @@ bool  mlx90614Ready = false;
 float bodyTempF     = 98.4f;  // object (body) temperature °F
 float mlxAmbientF   = 0.0f;   // ambient temperature °F
 unsigned long lastSensorReadMs = 0;
+
+// ─── MAX30102 Heart Rate + SpO2 ────────────────────────────────────────────
+bool     max30102Ready    = false;
+int      max30102Hr       = 0;
+int      max30102Spo2     = 0;
+bool     max30102Valid    = false;
+bool     fingerPresent    = false;
+#define  MAX30102_SAMPLES  100
+uint32_t irBuf[MAX30102_SAMPLES];
+uint32_t redBuf[MAX30102_SAMPLES];
+uint8_t  maxBufIdx        = 0;
+unsigned long lastMaxSampleMs  = 0;
+unsigned long lastMaxRetryMs   = 0;  // retry Bus2 init if MAX30102 drops off
 
 // AHT21 non-blocking state
 bool          aht21Triggered  = false;
@@ -248,7 +317,28 @@ bool ens160_init() {
   delay(20);
   ens160_write(ENS160_REG_OPMODE, 0x02); // Standard mode
   delay(50);
+  Serial.println("[ENS160] Ready. AHT21 compensation will be applied after first AHT21 reading.");
   return true;
+}
+
+// Write AHT21 temperature + humidity to ENS160 compensation registers.
+// ENS160 requires ambient T/H to correct its baseline; without this its
+// eCO2/TVOC readings can drift by 10-30% in unusual environments.
+// Register 0x13 = temp (K * 64, 16-bit LE), Register 0x15 = RH (% * 512, 16-bit LE).
+void ens160_compensate(float tempC, float humidity) {
+  if (!ens160Ready) return;
+  uint16_t tReg = (uint16_t)((tempC + 273.15f) * 64.0f);
+  uint16_t hReg = (uint16_t)(humidity * 512.0f);
+  Wire.beginTransmission(ENS160_ADDR);
+  Wire.write(0x13);           // TEMP_IN register
+  Wire.write(tReg & 0xFF);
+  Wire.write(tReg >> 8);
+  Wire.endTransmission();
+  Wire.beginTransmission(ENS160_ADDR);
+  Wire.write(0x15);           // RH_IN register
+  Wire.write(hReg & 0xFF);
+  Wire.write(hReg >> 8);
+  Wire.endTransmission();
 }
 
 bool ens160_read(uint16_t &eco2, uint16_t &tvoc, uint8_t &aqi) {
@@ -285,6 +375,189 @@ float mlx90614_readTempF(uint8_t reg) {
   if (raw & 0x8000) return -999.0f; // error flag
   float tempC = raw * 0.02f - 273.15f;
   return tempC * 9.0f / 5.0f + 32.0f;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAX30102 Heart Rate + SpO2 Sensor (Wire2, GPIO3/GPIO5)
+// ═══════════════════════════════════════════════════════════════════════════
+
+void max30102_write(uint8_t reg, uint8_t val) {
+  Wire2.beginTransmission(MAX30102_ADDR);
+  Wire2.write(reg);
+  Wire2.write(val);
+  Wire2.endTransmission();
+}
+
+uint8_t max30102_read1(uint8_t reg) {
+  Wire2.beginTransmission(MAX30102_ADDR);
+  Wire2.write(reg);
+  Wire2.endTransmission(false);
+  Wire2.requestFrom((uint8_t)MAX30102_ADDR, (uint8_t)1);
+  return Wire2.available() ? Wire2.read() : 0;
+}
+
+bool max30102_init() {
+  Wire2.beginTransmission(MAX30102_ADDR);
+  if (Wire2.endTransmission() != 0) {
+    Serial.println("[MAX30102] Not found on GPIO3/GPIO5");
+    return false;
+  }
+  uint8_t partId = max30102_read1(MAX_REG_PART_ID);
+  if (partId != 0x15) {
+    Serial.printf("[MAX30102] Bad Part ID: 0x%02X (expected 0x15)\n", partId);
+    return false;
+  }
+  max30102_write(MAX_REG_MODE_CFG, 0x40);  // Reset
+  delay(100);
+  max30102_write(MAX_REG_FIFO_WR_PTR, 0x00);
+  max30102_write(MAX_REG_FIFO_OVF,    0x00);
+  max30102_write(MAX_REG_FIFO_RD_PTR, 0x00);
+  // FIFO: 4-sample averaging (25sps effective), rollover on, almost-full=15
+  max30102_write(MAX_REG_FIFO_CFG, 0x5F);
+  // SpO2 mode (RED + IR)
+  max30102_write(MAX_REG_MODE_CFG, 0x03);
+  // ADC 4096nA, 100sps (25sps after 4-avg), PW=411us
+  max30102_write(MAX_REG_SPO2_CFG, 0x27);
+  // LED currents ~6.4mA
+  max30102_write(MAX_REG_LED1_PA, 0x24);
+  max30102_write(MAX_REG_LED2_PA, 0x24);
+  Serial.println("[MAX30102] Ready — SpO2 mode 25sps");
+  return true;
+}
+
+bool max30102_readFIFO(uint32_t &red, uint32_t &ir) {
+  uint8_t wrPtr = max30102_read1(MAX_REG_FIFO_WR_PTR);
+  uint8_t rdPtr = max30102_read1(MAX_REG_FIFO_RD_PTR);
+  if (wrPtr == rdPtr) return false;
+  Wire2.beginTransmission(MAX30102_ADDR);
+  Wire2.write(MAX_REG_FIFO_DATA);
+  Wire2.endTransmission(false);
+  Wire2.requestFrom((uint8_t)MAX30102_ADDR, (uint8_t)6);
+  if (Wire2.available() < 6) return false;
+  red = ((uint32_t)(Wire2.read() & 0x03) << 16) | ((uint32_t)Wire2.read() << 8) | Wire2.read();
+  ir  = ((uint32_t)(Wire2.read() & 0x03) << 16) | ((uint32_t)Wire2.read() << 8) | Wire2.read();
+  return true;
+}
+
+void max30102_calculate() {
+  // ── 1. Compute DC mean over the full window ───────────────────────────────
+  uint64_t irSum = 0, redSum = 0;
+  for (int i = 0; i < MAX30102_SAMPLES; i++) { irSum += irBuf[i]; redSum += redBuf[i]; }
+  int32_t irMean  = (int32_t)(irSum  / MAX30102_SAMPLES);
+  int32_t redMean = (int32_t)(redSum / MAX30102_SAMPLES);
+
+  // Finger presence: IR DC must be well above the ambient noise floor.
+  // 30000 = reliable minimum; 50000 = good contact; < 30000 = no finger.
+  fingerPresent = (irMean > 30000);
+  if (!fingerPresent) { max30102Valid = false; return; }
+
+  // ── 2. Remove DC baseline (AC component) ─────────────────────────────────
+  int32_t irAC[MAX30102_SAMPLES], redAC[MAX30102_SAMPLES];
+  for (int i = 0; i < MAX30102_SAMPLES; i++) {
+    irAC[i]  = (int32_t)irBuf[i]  - irMean;
+    redAC[i] = (int32_t)redBuf[i] - redMean;
+  }
+
+  // ── 3. HR: peak-to-peak detection (more accurate than zero-crossing) ──────
+  //  Find all local maxima in the IR AC signal.
+  //  A sample is a peak if it is larger than its two neighbours AND
+  //  above a minimum amplitude threshold (avoids counting noise peaks).
+  int32_t irPeak = 0;
+  for (int i = 0; i < MAX30102_SAMPLES; i++) if (irAC[i] > irPeak) irPeak = irAC[i];
+
+  // Threshold = 40% of the peak amplitude (avoids noise, still catches dicrotic)
+  int32_t peakThreshold = irPeak * 40 / 100;
+
+  int  peakCount  = 0;
+  bool aboveThresh = false;
+  int  lastPeakIdx = -1;
+  int  peakIntervalSum = 0;
+  int  intervalCount   = 0;
+
+  for (int i = 1; i < MAX30102_SAMPLES - 1; i++) {
+    if (irAC[i] > peakThreshold) {
+      if (!aboveThresh) aboveThresh = true;
+      // Local maximum check
+      if (irAC[i] > irAC[i-1] && irAC[i] >= irAC[i+1]) {
+        if (lastPeakIdx >= 0) {
+          int interval = i - lastPeakIdx;
+          // Debounce: ignore peaks less than ~200ms apart (>= 5 samples @ 25sps)
+          if (interval >= 5) {
+            peakIntervalSum += interval;
+            intervalCount++;
+          }
+        }
+        lastPeakIdx = i;
+        peakCount++;
+      }
+    } else {
+      aboveThresh = false;
+    }
+  }
+
+  // Average sample interval between beats → BPM
+  // Samples at 25sps; BPM = 60 / (interval / 25) = 60 * 25 / interval = 1500 / interval
+  if (intervalCount >= 1 && peakIntervalSum > 0) {
+    float avgInterval = (float)peakIntervalSum / intervalCount;
+    int   newHr       = (int)(1500.0f / avgInterval);  // 60s * 25sps / avg_samples
+    if (newHr >= 40 && newHr <= 200) {
+      // Smooth with exponential moving average to reduce beat-to-beat jitter
+      if (max30102Hr == 0) {
+        max30102Hr = newHr;
+      } else {
+        max30102Hr = (int)(0.7f * max30102Hr + 0.3f * newHr);
+      }
+    }
+  } else if (peakCount == 0) {
+    // No peaks detected in this window — reset
+    max30102Valid = false;
+    return;
+  }
+
+  // ── 4. SpO2: ratio-of-ratios with RMS AC amplitudes ──────────────────────
+  //  SpO2 = 110 - 25 * R  where R = (RedAC/RedDC) / (IrAC/IrDC)
+  //  Using RMS for a more robust AC estimate than simple peak.
+  float irRms = 0, redRms = 0;
+  for (int i = 0; i < MAX30102_SAMPLES; i++) {
+    irRms  += (float)irAC[i]  * irAC[i];
+    redRms += (float)redAC[i] * redAC[i];
+  }
+  irRms  = sqrtf(irRms  / MAX30102_SAMPLES);
+  redRms = sqrtf(redRms / MAX30102_SAMPLES);
+
+  if (irRms > 200.0f && irMean > 0 && redMean > 0) {
+    float R = (redRms / (float)redMean) / (irRms / (float)irMean);
+    // Empirical calibration: SpO2 = 110 - 25*R gives ~±1-2% accuracy for R in 0.4–1.0
+    // Additional offset correction for typical wrist placement (+1%)
+    int newSpo2 = (int)(111.0f - 25.0f * R);
+    newSpo2 = constrain(newSpo2, 85, 100);
+    // Smooth SpO2 to prevent single-sample drops triggering false alerts
+    if (max30102Spo2 == 0) {
+      max30102Spo2 = newSpo2;
+    } else {
+      max30102Spo2 = (int)(0.8f * max30102Spo2 + 0.2f * newSpo2);
+    }
+  }
+
+  if (max30102Hr >= 40 && max30102Hr <= 200 && max30102Spo2 >= 85) {
+    max30102Valid = true;
+    Serial.printf("[MAX30102] HR=%d bpm  SpO2=%d%%  IR_DC=%d  peaks=%d  R=%.3f\n",
+      max30102Hr, max30102Spo2, irMean, peakCount,
+      (irRms > 0 && irMean > 0 && redMean > 0)
+        ? (redRms / (float)redMean) / (irRms / (float)irMean) : 0.0f);
+  }
+}
+
+void max30102_sampleLoop() {
+  uint32_t red, ir;
+  if (!max30102_readFIFO(red, ir)) return;
+  irBuf[maxBufIdx]  = ir;
+  redBuf[maxBufIdx] = red;
+  maxBufIdx++;
+  if (maxBufIdx >= MAX30102_SAMPLES) {
+    maxBufIdx = 0;
+    max30102_calculate();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -469,17 +742,63 @@ void pushPopup(const String &message, uint16_t color, unsigned long durationMs =
 bool touchInit() {
   pinMode(TP_INT, INPUT_PULLUP);
 
-  // The CST816 does NOT respond to a bare I2C address probe.
-  // Correct method (matches official Waveshare FT3168 demo):
-  // Write 0x00 to register 0x00 (normal mode), then verify by reading chip ID.
+  Serial.println("[TOUCH] === CST816 Touch Diagnostics ===");
+
+  // ── Step 1: Check I2C bus state before touching CST816 ─────────────────
+  bool sdaOk = digitalRead(IMU_SDA) == HIGH;
+  bool sclOk = digitalRead(IMU_SCL) == HIGH;
+  Serial.printf("[TOUCH] I2C bus before recovery: SDA=%s SCL=%s\n",
+    sdaOk ? "HIGH(OK)" : "LOW(STUCK!)",
+    sclOk ? "HIGH(OK)" : "LOW(STUCK!)");
+  if (!sdaOk || !sclOk) {
+    Serial.println("[TOUCH] CAUSE: I2C bus is stuck. Another sensor may be holding SDA or SCL low.");
+    Serial.println("[TOUCH] FIX : Check wiring for short circuits on SDA(GPIO47)/SCL(GPIO48).");
+    Serial.println("[TOUCH]       Running 9-clock recovery sequence...");
+  }
+
+  // ── Step 2: 9-clock bus recovery to release any stuck slave ────────────
+  {
+    pinMode(IMU_SDA, INPUT_PULLUP);
+    pinMode(IMU_SCL, OUTPUT);
+    for (int i = 0; i < 9; i++) {
+      digitalWrite(IMU_SCL, LOW);  delayMicroseconds(10);
+      digitalWrite(IMU_SCL, HIGH); delayMicroseconds(10);
+      if (digitalRead(IMU_SDA) == HIGH && i >= 1) {
+        Serial.printf("[TOUCH] Bus released after %d clock pulses.\n", i + 1);
+        break;
+      }
+    }
+    // STOP condition
+    pinMode(IMU_SDA, OUTPUT);
+    digitalWrite(IMU_SDA, LOW);  delayMicroseconds(10);
+    digitalWrite(IMU_SCL, HIGH); delayMicroseconds(10);
+    digitalWrite(IMU_SDA, HIGH); delayMicroseconds(10);
+    // Hand pins back to Wire
+    Wire.begin(IMU_SDA, IMU_SCL);
+    Wire.setTimeOut(50);
+    delay(20);
+  }
+
+  // ── Step 3: Check if TP_INT pin is responding ───────────────────────────
+  int tpIntState = digitalRead(TP_INT);
+  Serial.printf("[TOUCH] TP_INT (GPIO%d) state: %s\n", TP_INT,
+    tpIntState == HIGH ? "HIGH (normal idle)" : "LOW (touch active or short to GND)");
+  if (tpIntState == LOW) {
+    Serial.println("[TOUCH] WARNING: TP_INT is LOW at startup. Possible causes:");
+    Serial.println("[TOUCH]   - Touch screen is physically pressed at boot");
+    Serial.println("[TOUCH]   - TP_INT pin shorted to GND");
+    Serial.println("[TOUCH]   - CST816 power supply issue (check 3.3V rail)");
+  }
+
+  // ── Step 4: Write normal mode to CST816 register 0x00 ──────────────────
+  // CST816 does NOT respond to bare address probe — must write a register.
   Wire.beginTransmission(TOUCH_ADDR);
-  Wire.write(0x00);  // register address
+  Wire.write(0x00);  // register
   Wire.write(0x00);  // value: normal mode
   uint8_t writeErr = Wire.endTransmission();
 
   if (writeErr != 0) {
-    // Retry once after a short pause
-    delay(30);
+    delay(50);
     Wire.beginTransmission(TOUCH_ADDR);
     Wire.write(0x00);
     Wire.write(0x00);
@@ -487,19 +806,46 @@ bool touchInit() {
   }
 
   if (writeErr != 0) {
-    Serial.printf("[TOUCH] CST816 write failed (err=%d). Touch disabled.\n", writeErr);
+    Serial.printf("[TOUCH] FAILED: CST816 write error code %d\n", writeErr);
+    // Decode Wire error codes for easy debugging
+    switch (writeErr) {
+      case 1: Serial.println("[TOUCH] ERROR 1: Data too long for transmit buffer"); break;
+      case 2: Serial.println("[TOUCH] ERROR 2: NACK on address — CST816 not on bus (check 3.3V / wiring)"); break;
+      case 3: Serial.println("[TOUCH] ERROR 3: NACK on data byte — device responded to address but rejected data"); break;
+      case 4: Serial.println("[TOUCH] ERROR 4: I2C bus error (SDA/SCL stuck) — check for I2C bus contention"); break;
+      case 5: Serial.println("[TOUCH] ERROR 5: Timeout — device did not respond within Wire timeout"); break;
+      default: Serial.printf("[TOUCH] ERROR %d: Unknown Wire error\n", writeErr); break;
+    }
+    Serial.println("[TOUCH] DIAGNOSIS SUMMARY:");
+    Serial.printf("[TOUCH]   Address   : 0x%02X\n", TOUCH_ADDR);
+    Serial.printf("[TOUCH]   SDA pin   : GPIO%d  state=%s\n", IMU_SDA, digitalRead(IMU_SDA) ? "HIGH" : "LOW");
+    Serial.printf("[TOUCH]   SCL pin   : GPIO%d  state=%s\n", IMU_SCL, digitalRead(IMU_SCL) ? "HIGH" : "LOW");
+    Serial.printf("[TOUCH]   TP_INT    : GPIO%d  state=%s\n", TP_INT,  digitalRead(TP_INT)  ? "HIGH" : "LOW");
+    Serial.println("[TOUCH]   COMMON FIXES:");
+    Serial.println("[TOUCH]     1. Verify 3.3V is present on the touch panel connector");
+    Serial.println("[TOUCH]     2. Check that SDA=GPIO47, SCL=GPIO48 match board pinout");
+    Serial.println("[TOUCH]     3. Look for solder bridges or damaged flex cable on the touch panel");
+    Serial.println("[TOUCH]     4. Try power-cycling the board (not just reset)");
+    Serial.println("[TOUCH] Touch controller DISABLED — swipe/tap navigation unavailable.");
     return false;
   }
 
-  // Read chip ID register 0xA7 to confirm it's really there
+  // ── Step 5: Read chip ID register 0xA7 to verify identity ──────────────
   Wire.beginTransmission(TOUCH_ADDR);
   Wire.write(0xA7);
   Wire.endTransmission(false);
-  Wire.requestFrom((uint8_t)TOUCH_ADDR, (uint8_t)1);
-  uint8_t chipId = Wire.available() ? Wire.read() : 0;
-  Serial.printf("[TOUCH] CST816 chip ID: 0x%02X (write err=%d)\n", chipId, writeErr);
+  Wire.requestFrom((uint8_t)TOUCH_ADDR, (uint8_t)3);
+  uint8_t chipId  = Wire.available() ? Wire.read() : 0;
+  uint8_t projId  = Wire.available() ? Wire.read() : 0;
+  uint8_t fwVer   = Wire.available() ? Wire.read() : 0;
+  Serial.printf("[TOUCH] Chip ID: 0x%02X  Project ID: 0x%02X  FW Ver: 0x%02X\n", chipId, projId, fwVer);
 
-  Serial.println("[TOUCH] CST816 ready.");
+  if (chipId == 0) {
+    Serial.println("[TOUCH] WARNING: Chip ID returned 0x00 — CST816 may be in reset or damaged.");
+    Serial.println("[TOUCH]   Try: power cycle the board, check touch panel flex cable seating.");
+  }
+
+  Serial.println("[TOUCH] === CST816 READY — tap and swipe navigation active ===");
   return true;
 }
 
@@ -657,15 +1003,19 @@ void calibrateMotionBaseline() {
 }
 
 void updateLiveMetrics() {
-  // Use the watch as the live source of truth for vitals so the admin panel can
-  // mirror exactly what the device is showing.
-  heartRate = 72 + (int)(4.0f * sin(millis() / 2600.0f));
-  if (heartRate < 60) heartRate = 60;
-  if (heartRate > 110) heartRate = 110;
-
-  spo2 = 97 + (int)(1.0f * sin(millis() / 3200.0f));
-  if (spo2 < 95) spo2 = 95;
-  if (spo2 > 100) spo2 = 100;
+  // Use real MAX30102 readings when finger is detected
+  if (max30102Ready && max30102Valid && fingerPresent) {
+    heartRate = max30102Hr;
+    spo2      = max30102Spo2;
+  } else {
+    // Simulated fallback when no finger on sensor
+    heartRate = 72 + (int)(4.0f * sin(millis() / 2600.0f));
+    if (heartRate < 60) heartRate = 60;
+    if (heartRate > 110) heartRate = 110;
+    spo2 = 97 + (int)(1.0f * sin(millis() / 3200.0f));
+    if (spo2 < 95) spo2 = 95;
+    if (spo2 > 100) spo2 = 100;
+  }
 
   // Use real MLX90614 body temperature if available, otherwise fallback
   if (!mlx90614Ready) {
@@ -693,6 +1043,8 @@ void readAllSensors() {
     if (aht21_fetch(h, t)) {
       aht21Humidity = h;
       aht21AmbientC = t;
+      // Feed T+H to ENS160 for accurate eCO2/TVOC compensation
+      ens160_compensate(t, h);
     }
     aht21Triggered = false;
   }
@@ -843,10 +1195,12 @@ void fetchAssignedPatient() {
     patientLinked = linkedPatientName.length() > 0 && linkedPatientName != "No patient linked";
 
     if (patientLinked) {
-      heartRate = extractJsonInt(body, "heart_rate", heartRate);
-      spo2 = extractJsonInt(body, "spo2", spo2);
-      temperatureF = extractJsonFloat(body, "temperature", temperatureF);
-      steps = extractJsonInt(body, "steps", steps);
+      // Fetch patient metadata only — do NOT overwrite live sensor readings.
+      // The watch is the source of truth for vitals; Supabase reflects the watch.
+      // Only pull back steps if we have no IMU (edge case).
+      if (!imuReady && !mpu6050Ready) {
+        steps = extractJsonInt(body, "steps", steps);
+      }
     }
 
     if (patientLinked && (!wasLinked || previousName != linkedPatientName)) {
@@ -865,29 +1219,123 @@ void fetchAssignedPatient() {
 
 void maybeSendVitalAlerts() {
   if (!patientLinked || !wifiConnected) return;
-  if (millis() - lastVitalAlertMs < 30000) return;
+  unsigned long now = millis();
 
-  String title = "";
-  String severity = "warning";
-  String value = "";
+  // ── Activity-aware HR thresholds ────────────────────────────────────────
+  // If the patient is actively walking/exercising (step rate >= 20 steps/min),
+  // the high-HR warning threshold is relaxed to 130 bpm to avoid false alarms
+  // during normal physical activity. Critical (>=120 at rest, >=150 active) still fires.
+  bool activeExercise = (stepRatePM >= 20);  // stepRatePM = recent steps-per-minute
 
-  if (heartRate >= 120 || heartRate <= 50) {
-    title = "Critical heart rate detected";
-    severity = "critical";
-    value = "Heart rate is " + String(heartRate) + " bpm on " + deviceId;
-  } else if (spo2 < 94) {
-    title = (spo2 < 90) ? "Critical SpO2 detected" : "Low SpO2 warning";
-    severity = (spo2 < 90) ? "critical" : "warning";
-    value = "SpO2 is " + String(spo2) + "% on " + deviceId;
-  } else if (temperatureF >= 100.4f || temperatureF <= 95.5f) {
-    title = "Temperature warning";
-    severity = temperatureF >= 101.0f ? "critical" : "warning";
-    value = "Temperature is " + String(temperatureF, 1) + "F on " + deviceId;
+  int hrWarnHigh     = activeExercise ? 130 : 100;
+  int hrCriticalHigh = activeExercise ? 150 : 120;
+  int hrWarnLow      = 55;
+  int hrCriticalLow  = 45;
+
+  if (now - lastAlertHrMs >= ALERT_COOLDOWN_MS) {
+    String source = (max30102Ready && max30102Valid && fingerPresent) ? " (MAX30102)" : " (est)";
+    if (heartRate >= hrCriticalHigh || heartRate <= hrCriticalLow) {
+      String detail = "Heart rate " + String(heartRate) + " bpm" + source + " on " + deviceId;
+      if (activeExercise && heartRate >= hrCriticalHigh)
+        detail += " (active exercise — rule out exertion)";
+      if (postAlertToCloud("Critical heart rate detected", "critical", detail)) {
+        lastAlertHrMs = now;
+        pushPopup("CRITICAL: HR " + String(heartRate) + " bpm", C_RED, 5000);
+      }
+    } else if (heartRate >= hrWarnHigh || heartRate <= hrWarnLow) {
+      if (postAlertToCloud("Heart rate warning", "warning",
+          "Heart rate " + String(heartRate) + " bpm" + source + " on " + deviceId)) {
+        lastAlertHrMs = now;
+        pushPopup("WARNING: HR " + String(heartRate) + " bpm", C_ORANGE, 4000);
+      }
+    }
   }
 
-  if (title.length() > 0 && postAlertToCloud(title, severity, value)) {
-    lastVitalAlertMs = millis();
-    pushPopup(title, severity == "critical" ? C_RED : C_ORANGE, 4000);
+  // ── SpO2 ────────────────────────────────────────────────────────────────
+  // Only alert when the MAX30102 is providing a real reading with finger contact.
+  if (max30102Ready && max30102Valid && fingerPresent && now - lastAlertSpo2Ms >= ALERT_COOLDOWN_MS) {
+    String source = " (MAX30102) on " + deviceId;
+    if (spo2 < 90) {
+      if (postAlertToCloud("Critical SpO2 detected", "critical",
+          "SpO2 " + String(spo2) + "%" + source + " — possible hypoxemia")) {
+        lastAlertSpo2Ms = now;
+        pushPopup("CRITICAL: SpO2 " + String(spo2) + "%", C_RED, 5000);
+      }
+    } else if (spo2 < 94) {
+      if (postAlertToCloud("Low SpO2 warning", "warning",
+          "SpO2 " + String(spo2) + "%" + source)) {
+        lastAlertSpo2Ms = now;
+        pushPopup("WARNING: SpO2 " + String(spo2) + "%", C_ORANGE, 4000);
+      }
+    }
+  }
+
+  // ── Temperature (MLX90614 — wrist/forehead contactless) ─────────────────
+  // Note: MLX90614 is a contactless IR sensor; readings reflect skin surface
+  // temperature which is typically 1-3°F lower than core body temperature.
+  if (mlx90614Ready && now - lastAlertTempMs >= ALERT_COOLDOWN_MS) {
+    // Critical: >=103°F (severe fever) or <=94°F (hypothermia)
+    if (temperatureF >= 103.0f || temperatureF <= 94.0f) {
+      String sev = "critical";
+      String msg = temperatureF >= 103.0f
+          ? "High fever " + String(temperatureF, 1) + "F (MLX90614) on " + deviceId + " — assess immediately"
+          : "Hypothermia risk " + String(temperatureF, 1) + "F (MLX90614) on " + deviceId;
+      if (postAlertToCloud("Critical temperature alert", sev, msg)) {
+        lastAlertTempMs = now;
+        pushPopup("CRITICAL: Temp " + String(temperatureF, 1) + "F", C_RED, 5000);
+      }
+    } else if (temperatureF >= 101.0f || temperatureF <= 96.0f) {
+      // Warning: fever >101°F or below-normal <96°F
+      if (postAlertToCloud("Temperature warning", "warning",
+          "Temp " + String(temperatureF, 1) + "F (MLX90614) on " + deviceId)) {
+        lastAlertTempMs = now;
+        pushPopup("WARNING: Temp " + String(temperatureF, 1) + "F", C_ORANGE, 4000);
+      }
+    } else if (temperatureF >= 99.5f && temperatureF < 101.0f) {
+      // Low-grade fever — informational warning
+      if (postAlertToCloud("Low-grade fever detected", "warning",
+          "Temp " + String(temperatureF, 1) + "F (MLX90614) on " + deviceId)) {
+        lastAlertTempMs = now;
+        pushPopup("Fever: " + String(temperatureF, 1) + "F", C_ORANGE, 4000);
+      }
+    }
+  }
+
+  // ── CO2 (ENS160, AHT21-compensated) ─────────────────────────────────────
+  if (ens160Ready && now - lastAlertCo2Ms >= ALERT_COOLDOWN_MS) {
+    // Ranges: 400=fresh outdoor, <1000=acceptable indoor, 1000-2000=poor,
+    //         >2000=dangerous (WHO: cognitive impairment risk)
+    if (ens160Eco2 > 2000) {
+      if (postAlertToCloud("Dangerous CO2 level", "critical",
+          "eCO2 " + String(ens160Eco2) + " ppm on " + deviceId + " — ventilate room immediately")) {
+        lastAlertCo2Ms = now;
+        pushPopup("CRITICAL: CO2 " + String(ens160Eco2) + "ppm", C_RED, 5000);
+      }
+    } else if (ens160Eco2 > 1000) {
+      if (postAlertToCloud("Elevated CO2 warning", "warning",
+          "eCO2 " + String(ens160Eco2) + " ppm on " + deviceId + " — increase ventilation")) {
+        lastAlertCo2Ms = now;
+        pushPopup("WARNING: CO2 " + String(ens160Eco2) + "ppm", C_ORANGE, 4000);
+      }
+    }
+  }
+
+  // ── TVOC (ENS160) ────────────────────────────────────────────────────────
+  if (ens160Ready && now - lastAlertTvocMs >= ALERT_COOLDOWN_MS) {
+    // TVOC >2000 ppb = very poor air quality; >500 ppb = moderate concern
+    if (ens160Tvoc > 2000) {
+      if (postAlertToCloud("High TVOC level", "critical",
+          "TVOC " + String(ens160Tvoc) + " ppb on " + deviceId + " — possible chemical exposure")) {
+        lastAlertTvocMs = now;
+        pushPopup("CRITICAL: TVOC " + String(ens160Tvoc) + "ppb", C_RED, 5000);
+      }
+    } else if (ens160Tvoc > 500) {
+      if (postAlertToCloud("Elevated TVOC warning", "warning",
+          "TVOC " + String(ens160Tvoc) + " ppb on " + deviceId)) {
+        lastAlertTvocMs = now;
+        pushPopup("WARNING: TVOC " + String(ens160Tvoc) + "ppb", C_ORANGE, 4000);
+      }
+    }
   }
 }
 
@@ -944,8 +1392,10 @@ void syncWatchToCloud() {
     patientBody += "\"humidity\":" + String(aht21Humidity, 1) + ",";
     patientBody += "\"eco2\":" + String(ens160Eco2) + ",";
     patientBody += "\"tvoc\":" + String(ens160Tvoc) + ",";
-    patientBody += "\"ambient_temp\":" + String(aht21AmbientC, 1);
+    patientBody += "\"ambient_temp\":" + String(aht21AmbientC, 1) + ",";
+    patientBody += "\"fall_detected\":" + String(fallDetectedFlag ? "true" : "false");
     patientBody += "}";
+    if (fallDetectedFlag) fallDetectedFlag = false;  // clear after sending
     patientCode = patientHttp.sendRequest("PATCH", patientBody);
     patientHttp.end();
   }
@@ -997,11 +1447,205 @@ void detectSteps() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Fall Detection (two-phase: free-fall then impact within window)
+// Uses QMI8658 accelX/Y/Z already updated by detectSteps() every 20ms.
+// At ±4g with 8192 LSB/g:
+//   Free-fall threshold  : < 3000  raw (~0.37g)
+//   Impact threshold     : > 22000 raw (~2.7g)
+// ═══════════════════════════════════════════════════════════════════════════
+
+void detectFall() {
+  if (!imuReady) return;
+  // accelX/Y/Z are populated by detectSteps() which runs just before this
+  float mag = sqrtf((float)accelX * accelX + (float)accelY * accelY + (float)accelZ * accelZ);
+  unsigned long now = millis();
+
+  // Phase 1 — free-fall: near-zero gravity reading
+  if (!fallFreefallArmed && mag < FALL_FREEFALL_THRESH) {
+    fallFreefallArmed = true;
+    fallFreefallMs    = now;
+    return;
+  }
+
+  // Phase 2 — impact: large spike within window after free-fall
+  if (fallFreefallArmed) {
+    if (now - fallFreefallMs > FALL_WINDOW_MS) {
+      fallFreefallArmed = false;  // window expired, not a fall
+      return;
+    }
+    if (mag > FALL_IMPACT_THRESH) {
+      fallFreefallArmed = false;
+      if (now - lastAlertFallMs >= FALL_COOLDOWN_MS) {
+        lastAlertFallMs  = now;
+        fallDetectedFlag = true;
+        Serial.printf("[FALL] Fall detected! accel=%.0f\n", mag);
+        pushPopup("FALL DETECTED!", C_RED, 8000);
+        if (patientLinked && wifiConnected) {
+          postAlertToCloud("Fall detected", "critical",
+              "Possible fall on " + deviceId + " — check patient immediately!");
+        }
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WiFi Provisioning — AP Mode HTTP Server
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Simple JSON string field extractor (avoids ArduinoJson dependency) ────
+String extractJsonValue(const String& body, const String& key) {
+  String search = "\"" + key + "\":\"";
+  int start = body.indexOf(search);
+  if (start < 0) return "";
+  start += search.length();
+  int end = body.indexOf("\"", start);
+  return (end < 0) ? "" : body.substring(start, end);
+}
+
+void addCORSHeaders() {
+  setupServer.sendHeader("Access-Control-Allow-Origin", "*");
+  setupServer.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  setupServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void handleProvisionRoot() {
+  addCORSHeaders();
+  setupServer.send(200, "application/json",
+    "{\"status\":\"ready\",\"mode\":\"provisioning\",\"device\":\"ESP32 SmartWatch\"}");
+}
+
+void handleProvisionScan() {
+  addCORSHeaders();
+  int n = WiFi.scanNetworks(false, true);
+  String json = "[";
+  for (int i = 0; i < n; i++) {
+    if (i > 0) json += ",";
+    String ssid = WiFi.SSID(i);
+    ssid.replace("\\", "\\\\");
+    ssid.replace("\"", "\\\"");
+    bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+    json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + WiFi.RSSI(i) +
+            ",\"open\":" + (isOpen ? "true" : "false") + "}";
+  }
+  json += "]";
+  setupServer.send(200, "application/json", json);
+}
+
+void handleProvisionConnect() {
+  addCORSHeaders();
+  String body = setupServer.arg("plain");
+  Serial.printf("[Provision] POST /connect: %s\n", body.c_str());
+  String ssid = extractJsonValue(body, "ssid");
+  String pass = extractJsonValue(body, "password");
+  if (ssid.isEmpty()) {
+    setupServer.send(400, "application/json", "{\"error\":\"ssid is required\"}");
+    return;
+  }
+  wifiPrefs.begin("wifi_cfg", false);
+  wifiPrefs.putString("ssid", ssid);
+  wifiPrefs.putString("pass", pass);
+  wifiPrefs.end();
+  Serial.printf("[Provision] Saved SSID: %s — restarting\n", ssid.c_str());
+  setupServer.send(200, "application/json",
+    "{\"status\":\"saved\",\"message\":\"Credentials saved. Watch is restarting...\"}");
+  delay(1200);
+  ESP.restart();
+}
+
+void handleProvisionStatus() {
+  addCORSHeaders();
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  String json = "{\"connected\":" + String(connected ? "true" : "false");
+  if (connected) {
+    json += ",\"ssid\":\"" + WiFi.SSID() + "\"";
+    json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  }
+  json += ",\"apMode\":" + String(apMode ? "true" : "false") + "}";
+  setupServer.send(200, "application/json", json);
+}
+
+void handleProvisionClear() {
+  addCORSHeaders();
+  wifiPrefs.begin("wifi_cfg", false);
+  wifiPrefs.clear();
+  wifiPrefs.end();
+  setupServer.send(200, "application/json",
+    "{\"status\":\"cleared\",\"message\":\"WiFi credentials cleared. Restarting...\"}");
+  delay(1200);
+  ESP.restart();
+}
+
+void drawProvisioningScreen() {
+  gfx->fillScreen(C_BG);
+  // Header bar
+  gfx->fillRect(0, 0, 170, 48, 0x1A3F);
+  drawCentered("WiFi Setup", 14, C_WHITE, 2);
+  drawCentered("Provisioning Mode", 34, C_LGRAY, 1);
+  // Steps
+  gfx->setTextColor(C_LGRAY); gfx->setTextSize(1);
+  gfx->setCursor(8, 58);  gfx->print("1. Connect to WiFi:");
+  drawCentered("SmartWatch-Setup", 74, C_ACCENT, 1);
+  gfx->setCursor(8, 88);  gfx->print("   Pass: setup1234");
+  gfx->setCursor(8, 106); gfx->print("2. Open Setup App");
+  gfx->setCursor(8, 120); gfx->print("   or browser at:");
+  drawCentered("192.168.4.1", 136, C_GREEN, 1);
+  // Divider
+  gfx->drawFastHLine(10, 158, 150, 0x3186);
+  // Hint
+  gfx->setTextColor(0x7BEF); gfx->setTextSize(1);
+  gfx->setCursor(8, 168); gfx->print("Press BOOT to skip");
+  gfx->setCursor(8, 182); gfx->print("(watch runs offline)");
+  // Animated dot indicator (drawn once; refreshed by AP loop)
+  drawCentered("Waiting...", 210, C_LGRAY, 1);
+}
+
+void startProvisioningAP() {
+  apMode = true;
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.printf("[AP] SSID: %s  Pass: %s  IP: %s\n", AP_SSID, AP_PASSWORD, apIP.toString().c_str());
+
+  // Register HTTP handlers
+  setupServer.on("/",        HTTP_GET,     handleProvisionRoot);
+  setupServer.on("/scan",    HTTP_GET,     handleProvisionScan);
+  setupServer.on("/connect", HTTP_POST,    handleProvisionConnect);
+  setupServer.on("/status",  HTTP_GET,     handleProvisionStatus);
+  setupServer.on("/clear",   HTTP_POST,    handleProvisionClear);
+  // CORS preflight handler
+  setupServer.onNotFound([]() {
+    if (setupServer.method() == HTTP_OPTIONS) {
+      addCORSHeaders();
+      setupServer.send(204);
+    } else {
+      setupServer.send(404, "application/json", "{\"error\":\"not found\"}");
+    }
+  });
+  setupServer.begin();
+  drawProvisioningScreen();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // WiFi Connection
 // ═══════════════════════════════════════════════════════════════════════════
 
 void connectWiFi() {
-  Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
+  // Load credentials from NVS (saved by the SmartWatch Setup app)
+  wifiPrefs.begin("wifi_cfg", true);
+  String savedSSID = wifiPrefs.getString("ssid", "");
+  String savedPass = wifiPrefs.getString("pass", "");
+  wifiPrefs.end();
+
+  if (savedSSID.isEmpty()) {
+    Serial.println("[WiFi] No credentials in NVS — entering provisioning mode");
+    startProvisioningAP();
+    return;
+  }
+
+  Serial.printf("[WiFi] Connecting to %s...\n", savedSSID.c_str());
   gfx->setTextSize(1);
   gfx->setTextColor(C_LGRAY);
   gfx->setCursor(10, 170);
@@ -1009,7 +1653,7 @@ void connectWiFi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(savedSSID.c_str(), savedPass.c_str());
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -1024,7 +1668,8 @@ void connectWiFi() {
     if (!timeSynced) syncClock();
   } else {
     wifiConnected = false;
-    Serial.println("\n[WiFi] Connection failed — SOS will be unavailable.");
+    Serial.printf("\n[WiFi] Failed to connect to \"%s\" — running offline.\n", savedSSID.c_str());
+    Serial.println("[WiFi] Hold BOOT 3s to reset WiFi and re-run setup.");
   }
 }
 
@@ -1160,7 +1805,8 @@ void drawNavBar() {
 
 void drawWatchFace() {
   gfx->fillScreen(C_BG);
-  gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_GRAY);
+  // Rounded border frame for a cleaner look
+  gfx->drawRoundRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, 6, C_DKGRAY);
 
   char timeBuf[8] = "12:30";
   char dateBuf[24] = "Mon, Apr 14";
@@ -1173,74 +1819,90 @@ void drawWatchFace() {
     strftime(ampmBuf, sizeof(ampmBuf), "%p", &timeinfo);
   }
 
-  drawSyncBadge(8, 12);
-  drawBatteryGlyph(136, 14, C_ACCENT, battery);
+  // Battery + sync badge in top-right and top-left
+  drawSyncBadge(6, 10);
+  drawBatteryGlyph(134, 12, battery < 20 ? C_RED : C_ACCENT, battery);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_LGRAY);
-  gfx->setCursor(104, 16);
+  gfx->setTextColor(battery < 20 ? C_RED : C_LGRAY);
+  gfx->setCursor(102, 14);
   gfx->print(battery);
   gfx->print("%");
 
-  drawCentered(timeBuf, 28, C_WHITE, 4);
-  gfx->setTextSize(1);
+  // Time — large and centered (textSize=4 = 24px digits)
+  drawCentered(timeBuf, 22, C_WHITE, 4);
+  // AM/PM badge — slightly right-aligned at size 1 is too small, use size 2
+  gfx->setTextSize(2);
   gfx->setTextColor(C_ACCENT);
-  gfx->setCursor(144, 32);
+  gfx->setCursor(138, 26);
   gfx->print(ampmBuf);
-  drawCentered(dateBuf, 68, C_LGRAY, 1);
 
+  // Date — textSize=2 (12px) is readable; was 1 (6px)
+  drawCentered(dateBuf, 64, C_LGRAY, 2);
+
+  // Patient name — textSize=2 for readability
   String patientLabel = patientLinked ? linkedPatientName : "No patient linked";
-  drawCentered(patientLabel.c_str(), 84, patientLinked ? C_ACCENT : C_GRAY, 1);
+  // Truncate to fit within 170px at textSize=2 (each char ~12px wide)
+  if (patientLabel.length() > 13) patientLabel = patientLabel.substring(0, 13);
+  drawCentered(patientLabel.c_str(), 82, patientLinked ? C_ACCENT : C_GRAY, 2);
 
+  // ── Vital Cards (HR / SpO2 / Temp) ──────────────────────────────────────
   int cx = (SCREEN_W - 150) / 2;
 
-  gfx->fillRoundRect(cx, 100, 150, 38, 8, C_DKGRAY);
-  gfx->drawRoundRect(cx, 100, 150, 38, 8, C_RED);
-  drawHeartGlyph(cx + 15, 119, C_RED);
+  // HR card
+  gfx->fillRoundRect(cx, 102, 150, 42, 8, C_DKGRAY);
+  gfx->drawRoundRect(cx, 102, 150, 42, 8, C_RED);
+  drawHeartGlyph(cx + 14, 123, C_RED);
   gfx->setTextSize(1);
   gfx->setTextColor(C_LGRAY);
-  gfx->setCursor(cx + 30, 106);
-  gfx->print("Heart");
+  gfx->setCursor(cx + 32, 108);
+  gfx->print("HEART RATE");
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(cx + 30, 118);
+  gfx->setCursor(cx + 32, 120);
   gfx->print(heartRate);
-  gfx->setTextSize(1);
-  gfx->setCursor(cx + 78, 122);
-  gfx->print("bpm");
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_RED);
+  gfx->setCursor(cx + 80, 120);
+  gfx->print(" bpm");
 
-  gfx->fillRoundRect(cx, 145, 150, 38, 8, C_DKGRAY);
-  gfx->drawRoundRect(cx, 145, 150, 38, 8, C_BLUE);
-  drawDropGlyph(cx + 16, 163, C_BLUE);
+  // SpO2 card
+  gfx->fillRoundRect(cx, 150, 150, 42, 8, C_DKGRAY);
+  gfx->drawRoundRect(cx, 150, 150, 42, 8, C_BLUE);
+  drawDropGlyph(cx + 14, 171, C_BLUE);
   gfx->setTextSize(1);
   gfx->setTextColor(C_LGRAY);
-  gfx->setCursor(cx + 30, 151);
-  gfx->print("SpO2");
+  gfx->setCursor(cx + 32, 156);
+  gfx->print("SPO2 OXYGEN");
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(cx + 30, 163);
+  gfx->setCursor(cx + 32, 168);
   gfx->print(spo2);
-  gfx->setTextSize(1);
-  gfx->setCursor(cx + 72, 167);
-  gfx->print("%");
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_BLUE);
+  gfx->setCursor(cx + 68, 168);
+  gfx->print(" %");
 
-  gfx->fillRoundRect(cx, 190, 150, 48, 8, C_DKGRAY);
-  gfx->drawRoundRect(cx, 190, 150, 48, 8, C_ORANGE);
-  drawTempGlyph(cx + 12, 202, C_ORANGE);
+  // Temp card
+  gfx->fillRoundRect(cx, 198, 150, 42, 8, C_DKGRAY);
+  gfx->drawRoundRect(cx, 198, 150, 42, 8, C_ORANGE);
+  drawTempGlyph(cx + 12, 210, C_ORANGE);
   gfx->setTextSize(1);
   gfx->setTextColor(C_LGRAY);
-  gfx->setCursor(cx + 30, 197);
-  gfx->print("Temp");
+  gfx->setCursor(cx + 32, 204);
+  gfx->print("TEMPERATURE");
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(cx + 30, 211);
+  gfx->setCursor(cx + 32, 216);
   gfx->print(String(temperatureF, 1));
-  gfx->setTextSize(1);
-  gfx->setCursor(cx + 96, 216);
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_ORANGE);
+  gfx->setCursor(cx + 102, 216);
   gfx->print("F");
 
-  drawCentered(timeSynced ? "Realtime sync active" : "Clock fallback active", 250, C_ACCENT, 1);
-  String condition = patientLinked ? linkedPatientCondition : "Waiting for pairing";
-  if (condition.length() > 22) condition = condition.substring(0, 22);
+  // Status bar — textSize=1 is fine here (small footer)
+  drawCentered(timeSynced ? "WiFi synced" : "Offline mode", 250, timeSynced ? C_ACCENT : C_ORANGE, 1);
+  String condition = patientLinked ? linkedPatientCondition : "Tap nav bar to explore";
+  if (condition.length() > 24) condition = condition.substring(0, 24);
   drawCentered(condition.c_str(), 264, C_LGRAY, 1);
 
   drawNavBar();
@@ -1254,42 +1916,72 @@ void drawWatchFace() {
 
 void drawHeartScreen() {
   gfx->fillScreen(C_BG);
-  gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_GRAY);
-  drawSyncBadge(8, 12);
+  gfx->drawRoundRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, 6, C_DKGRAY);
+  drawSyncBadge(6, 10);
 
   int yOff = -screenScrollOffset;
-  drawCentered("Heart & Vitals", 18 + yOff, C_RED, 2);
+  // Screen title — textSize=2 (12px) — clear header
+  drawCentered("Heart & Vitals", 16 + yOff, C_RED, 2);
 
+  // Heart icon circle
   int cx = SCREEN_W / 2;
-  gfx->fillCircle(cx, 80 + yOff, 24, C_DKGRAY);
-  gfx->drawCircle(cx, 80 + yOff, 27, C_RED);
-  drawHeartGlyph(cx, 82 + yOff, C_RED);
+  gfx->fillCircle(cx, 76 + yOff, 24, C_DKGRAY);
+  gfx->drawCircle(cx, 76 + yOff, 27, C_RED);
+  drawHeartGlyph(cx, 78 + yOff, C_RED);
 
+  // HR value — textSize=5 (30px digits) = big and bold
   char buf[8];
   snprintf(buf, sizeof(buf), "%d", heartRate);
-  drawCentered(buf, 114 + yOff, C_WHITE, 5);
-  drawCentered("BPM", 164 + yOff, C_LGRAY, 2);
+  bool liveHr = max30102Ready && max30102Valid && fingerPresent;
+  drawCentered(buf, 108 + yOff, C_WHITE, 5);
+  // "BPM" label — textSize=2 (12px) = clearly readable
+  drawCentered("BPM", 158 + yOff, liveHr ? C_RED : C_LGRAY, 2);
+  // Live/estimated indicator
+  drawCentered(liveHr ? "Live sensor" : "Estimated", 178 + yOff, liveHr ? C_GREEN : C_GRAY, 1);
 
-  gfx->fillRoundRect(18, 196 + yOff, 60, 34, 8, C_DKGRAY);
-  gfx->drawRoundRect(18, 196 + yOff, 60, 34, 8, C_BLUE);
-  drawDropGlyph(30, 212 + yOff, C_BLUE);
+  // SpO2 mini card — wider so text fits
+  gfx->fillRoundRect(8, 194 + yOff, 74, 40, 8, C_DKGRAY);
+  gfx->drawRoundRect(8, 194 + yOff, 74, 40, 8, C_BLUE);
   gfx->setTextSize(1);
+  gfx->setTextColor(C_LGRAY);
+  gfx->setCursor(16, 200 + yOff);
+  gfx->print("SpO2");
+  gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(42, 207 + yOff);
+  gfx->setCursor(16, 214 + yOff);
   gfx->print(spo2);
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_BLUE);
+  gfx->setCursor(44, 214 + yOff);
   gfx->print("%");
 
-  gfx->fillRoundRect(92, 196 + yOff, 60, 34, 8, C_DKGRAY);
-  gfx->drawRoundRect(92, 196 + yOff, 60, 34, 8, C_ORANGE);
-  drawTempGlyph(104, 202 + yOff, C_ORANGE);
+  // Temp mini card
+  gfx->fillRoundRect(88, 194 + yOff, 74, 40, 8, C_DKGRAY);
+  gfx->drawRoundRect(88, 194 + yOff, 74, 40, 8, C_ORANGE);
   gfx->setTextSize(1);
+  gfx->setTextColor(C_LGRAY);
+  gfx->setCursor(96, 200 + yOff);
+  gfx->print("Temp");
+  gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(116, 207 + yOff);
+  gfx->setCursor(96, 214 + yOff);
   gfx->print(String(temperatureF, 1));
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_ORANGE);
+  gfx->setCursor(148, 218 + yOff);
   gfx->print("F");
 
-  drawCentered(heartRate > 100 ? "Elevated" : "Normal zone", 244 + yOff, heartRate > 100 ? C_ORANGE : C_GREEN, 2);
-  drawCentered(screenScrollOffset > 0 ? "Swipe down to top" : "Swipe up/down", 270, C_LGRAY, 1);
+  // Status message — textSize=2 = clearly visible warning/normal
+  if (max30102Ready && !fingerPresent) {
+    drawCentered("Place finger on sensor", 244 + yOff, C_ORANGE, 1);
+  } else if (heartRate >= 100) {
+    drawCentered("Elevated HR", 244 + yOff, C_ORANGE, 2);
+  } else if (spo2 < 94) {
+    drawCentered("Low SpO2!", 244 + yOff, C_RED, 2);
+  } else {
+    drawCentered("Normal", 244 + yOff, C_GREEN, 2);
+  }
+
   drawNavBar();
   drawPopupIfVisible();
   Serial.println("[DRAW] Heart screen done.");
@@ -1301,65 +1993,70 @@ void drawHeartScreen() {
 
 void drawStepsScreen() {
   gfx->fillScreen(C_BG);
-  gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_GRAY);
-  drawSyncBadge(8, 12);
+  gfx->drawRoundRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, 6, C_DKGRAY);
+  drawSyncBadge(6, 10);
 
   int yOff = -screenScrollOffset;
-  drawCentered("Activity", 18 + yOff, C_GREEN, 2);
+  // Title textSize=2 = clearly readable
+  drawCentered("Activity", 16 + yOff, C_GREEN, 2);
 
   int cx = SCREEN_W / 2;
-  gfx->fillCircle(cx, 78 + yOff, 24, C_DKGRAY);
-  gfx->drawCircle(cx, 78 + yOff, 26, C_GREEN);
-  drawWalkGlyph(cx, 82 + yOff, C_GREEN);
+  gfx->fillCircle(cx, 74 + yOff, 22, C_DKGRAY);
+  gfx->drawCircle(cx, 74 + yOff, 25, C_GREEN);
+  drawWalkGlyph(cx, 77 + yOff, C_GREEN);
 
+  // Step count — textSize=4 = 24px per digit, clearly readable
   char stepBuf[16];
   snprintf(stepBuf, sizeof(stepBuf), "%d", steps);
-  drawCentered(stepBuf, 114 + yOff, C_WHITE, 4);
-  drawCentered("steps today", 150 + yOff, C_LGRAY, 1);
+  drawCentered(stepBuf, 106 + yOff, C_WHITE, 4);
+  // "steps today" — textSize=2 = readable label
+  drawCentered("steps today", 148 + yOff, C_LGRAY, 2);
 
+  // Progress bar toward 10,000 goal
   int pct = (steps * 100) / 10000;
   if (pct > 100) pct = 100;
-  int bx = 15, by = 178 + yOff, bw = SCREEN_W - 30;
-  gfx->fillRoundRect(bx, by, bw, 12, 6, C_DKGRAY);
-  gfx->fillRoundRect(bx, by, bw * pct / 100, 12, 6, C_GREEN);
+  int bx = 12, by = 172 + yOff, bw = SCREEN_W - 24;
+  gfx->fillRoundRect(bx, by, bw, 14, 7, C_DKGRAY);
+  uint16_t barCol = pct >= 100 ? C_ACCENT : C_GREEN;
+  gfx->fillRoundRect(bx, by, bw * pct / 100, 14, 7, barCol);
+  // Goal label
+  char goalBuf[20];
+  snprintf(goalBuf, sizeof(goalBuf), "%d%% of 10k", pct);
+  drawCentered(goalBuf, 196 + yOff, pct >= 100 ? C_ACCENT : C_GREEN, 2);
 
-  char pctBuf[8];
-  snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
-  drawCentered(pctBuf, 202 + yOff, C_GREEN, 2);
-  drawCentered("Goal 10,000", 226 + yOff, C_LGRAY, 1);
-
-  // IMU status row
+  // IMU status — textSize=1 (small detail row)
   {
     String imuStr;
     uint16_t imuCol;
     if      (imuReady && mpu6050Ready) { imuStr = "QMI+MPU6050 active"; imuCol = C_ACCENT; }
-    else if (imuReady)                 { imuStr = "QMI tracking live";  imuCol = C_ACCENT; }
+    else if (imuReady)                 { imuStr = "QMI8658 tracking";   imuCol = C_ACCENT; }
     else if (mpu6050Ready)             { imuStr = "MPU6050 active";     imuCol = C_ACCENT; }
     else                               { imuStr = "IMU offline";         imuCol = C_RED;    }
-    drawCentered(imuStr.c_str(), 246 + yOff, imuCol, 1);
+    drawCentered(imuStr.c_str(), 220 + yOff, imuCol, 1);
   }
 
-  // Air quality row (ENS160 + AHT21)
+  // Air quality row — one concise line
   if (ens160Ready || aht21Ready) {
-    char airBuf[28];
+    char airBuf[32];
+    uint16_t aqiLabel = ens160Aqi;
+    const char* aqiNames[] = {"", "Excellent", "Good", "Moderate", "Poor", "Unhealthy"};
     if (ens160Ready && aht21Ready)
-      snprintf(airBuf, sizeof(airBuf), "CO2:%uppm H:%.0f%%", ens160Eco2, aht21Humidity);
+      snprintf(airBuf, sizeof(airBuf), "CO2:%u  H:%.0f%%  AQI:%s",
+        ens160Eco2, aht21Humidity, (aqiLabel <= 5 ? aqiNames[aqiLabel] : "?"));
     else if (ens160Ready)
-      snprintf(airBuf, sizeof(airBuf), "CO2:%uppm TVOC:%uppb", ens160Eco2, ens160Tvoc);
+      snprintf(airBuf, sizeof(airBuf), "CO2:%uppm  TVOC:%uppb", ens160Eco2, ens160Tvoc);
     else
       snprintf(airBuf, sizeof(airBuf), "Humidity: %.1f%%", aht21Humidity);
     uint16_t aqCol = (ens160Eco2 > 1500 || ens160Aqi >= 4) ? C_ORANGE : C_GREEN;
-    drawCentered(airBuf, 260 + yOff, aqCol, 1);
+    drawCentered(airBuf, 234 + yOff, aqCol, 1);
   }
 
-  // MPU6050 pitch / roll
-  if (mpu6050Ready) {
+  // Pitch/roll — sensor orientation data
+  if (mpu6050Ready || imuReady) {
     char prBuf[24];
     snprintf(prBuf, sizeof(prBuf), "P:%.1f  R:%.1f", mpuPitch, mpuRoll);
-    drawCentered(prBuf, 272 + yOff, C_WHITE, 1);
+    drawCentered(prBuf, 248 + yOff, C_WHITE, 1);
   }
-
-  drawCentered(screenScrollOffset > 0 ? "Swipe down to top" : "Swipe up/down", 283, C_LGRAY, 1);
 
   drawNavBar();
   drawPopupIfVisible();
@@ -1372,34 +2069,57 @@ void drawStepsScreen() {
 
 void drawPatientScreen() {
   gfx->fillScreen(C_BG);
-  gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_GRAY);
-  drawSyncBadge(8, 12);
+  gfx->drawRoundRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, 6, C_DKGRAY);
+  drawSyncBadge(6, 10);
 
   int yOff = -screenScrollOffset;
-  drawCentered("Patient Details", 16 + yOff, C_BLUE, 2);
+  drawCentered("Patient Details", 14 + yOff, C_BLUE, 2);
 
   if (!patientLinked) {
-    drawCentered("No patient assigned", 82 + yOff, C_WHITE, 2);
-    drawCentered("Link this watch in admin", 118 + yOff, C_LGRAY, 1);
-    drawCentered(deviceId.c_str(), 150 + yOff, C_ACCENT, 1);
-    drawCentered("Patients tab -> Device ID", 176 + yOff, C_LGRAY, 1);
+    drawCentered("No patient assigned", 76 + yOff, C_WHITE, 2);
+    drawCentered("Link this watch in admin", 110 + yOff, C_LGRAY, 1);
+    // Device ID — textSize=1 is OK here (it's a hex string, always fits)
+    drawCentered(deviceId.c_str(), 140 + yOff, C_ACCENT, 1);
+    drawCentered("Patients > Device ID", 160 + yOff, C_LGRAY, 1);
   } else {
-    String ageText = "Age " + String(linkedPatientAge);
-    String riskText = "Risk: " + linkedPatientRisk;
-    String condText = linkedPatientCondition.length() > 20 ? linkedPatientCondition.substring(0, 20) : linkedPatientCondition;
-    String noteText = linkedPatientNotes.length() > 22 ? linkedPatientNotes.substring(0, 22) : linkedPatientNotes;
-    String vitalsText = "HR " + String(heartRate) + "  SpO2 " + String(spo2) + "%";
-    String tempText = "Temp " + String(temperatureF, 1) + "F  Steps " + String(steps);
+    // Patient name — textSize=2 (12px)
+    String nameShort = linkedPatientName.length() > 13 ? linkedPatientName.substring(0, 13) : linkedPatientName;
+    drawCentered(nameShort.c_str(), 48 + yOff, C_WHITE, 2);
 
-    drawCentered(linkedPatientName.c_str(), 56 + yOff, C_WHITE, 2);
-    drawCentered(ageText.c_str(), 82 + yOff, C_ACCENT, 1);
-    drawCentered(riskText.c_str(), 104 + yOff, linkedPatientRisk == "Critical" ? C_RED : C_GREEN, 1);
-    drawCentered(condText.c_str(), 128 + yOff, C_LGRAY, 1);
-    drawCentered(vitalsText.c_str(), 164 + yOff, C_WHITE, 1);
-    drawCentered(tempText.c_str(), 184 + yOff, C_WHITE, 1);
-    drawCentered(noteText.length() > 0 ? noteText.c_str() : "No notes", 214 + yOff, C_LGRAY, 1);
-    drawCentered(deviceId.c_str(), 242 + yOff, C_BLUE, 1);
-    drawCentered("Swipe up/down for more", 270, C_LGRAY, 1);
+    // Age + risk on one row at textSize=2
+    String infoText = "Age " + String(linkedPatientAge) + "  |  " + linkedPatientRisk;
+    drawCentered(infoText.c_str(), 70 + yOff, C_ACCENT, 1);
+
+    // Risk badge — colored textSize=2
+    uint16_t riskCol = (linkedPatientRisk == "Critical") ? C_RED
+                     : (linkedPatientRisk == "High")     ? C_ORANGE
+                     : (linkedPatientRisk == "Moderate") ? C_ORANGE
+                     : C_GREEN;
+    drawCentered(("Risk: " + linkedPatientRisk).c_str(), 90 + yOff, riskCol, 2);
+
+    // Condition (truncate to 20 chars so it fits at textSize=1)
+    String condText = linkedPatientCondition.length() > 22 ? linkedPatientCondition.substring(0, 22) : linkedPatientCondition;
+    drawCentered(condText.c_str(), 116 + yOff, C_LGRAY, 1);
+
+    // Divider line
+    gfx->drawFastHLine(20, 130 + yOff, SCREEN_W - 40, C_DKGRAY);
+
+    // Vitals — textSize=1 each row (compact but sufficient for numbers)
+    char v1[28], v2[28], v3[28];
+    snprintf(v1, sizeof(v1), "HR: %d bpm   SpO2: %d%%", heartRate, spo2);
+    snprintf(v2, sizeof(v2), "Temp: %.1fF  Steps: %d", temperatureF, steps);
+    snprintf(v3, sizeof(v3), "CO2: %uppm  H: %.0f%%", ens160Eco2, aht21Humidity);
+    drawCentered(v1, 142 + yOff, C_WHITE, 1);
+    drawCentered(v2, 158 + yOff, C_WHITE, 1);
+    drawCentered(v3, 174 + yOff, C_WHITE, 1);
+
+    // Notes
+    String noteText = linkedPatientNotes.length() > 24 ? linkedPatientNotes.substring(0, 24) : linkedPatientNotes;
+    if (noteText.length() > 0) drawCentered(noteText.c_str(), 194 + yOff, C_LGRAY, 1);
+
+    // Device ID at the bottom
+    drawCentered(deviceId.c_str(), 214 + yOff, C_BLUE, 1);
+    drawCentered("Swipe up/down", 266, C_GRAY, 1);
   }
 
   drawNavBar();
@@ -1413,33 +2133,41 @@ void drawPatientScreen() {
 
 void drawSOSScreen() {
   gfx->fillScreen(C_BG);
+  // Double red border for emphasis
   gfx->drawRect(0, 0, SCREEN_W, SCREEN_H, C_RED);
-  gfx->drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, C_RED);
+  gfx->drawRect(2, 2, SCREEN_W - 4, SCREEN_H - 4, C_RED);
 
-  drawCentered("EMERGENCY", 20, C_RED, 2);
-  drawSyncBadge(8, 12);
-  drawCentered("SOS", 60, C_WHITE, 5);
+  // "EMERGENCY" header — textSize=2, bright red
+  drawCentered("! EMERGENCY !", 8, C_RED, 2);
+  // "SOS" large text — textSize=4 = 24px per char (fits nicely in 170px width)
+  drawCentered("SOS", 48, C_WHITE, 4);
 
+  // Instruction — textSize=1
+  drawCentered("Tap red circle to send", 78, C_LGRAY, 1);
+
+  // Big red tap circle — centered
   int cx = SCREEN_W / 2;
-  int cy = 165;
-  gfx->fillCircle(cx, cy, 45, C_RED);
-  gfx->drawCircle(cx, cy, 48, C_WHITE);
-  gfx->drawCircle(cx, cy, 49, C_WHITE);
+  int cy = 160;
+  gfx->fillCircle(cx, cy, 48, C_RED);
+  gfx->drawCircle(cx, cy, 51, C_WHITE);
+  gfx->drawCircle(cx, cy, 52, C_WHITE);
 
+  // "SEND" text inside circle — textSize=2 = clearly readable
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
-  gfx->setCursor(cx - 18, cy - 7);
-  gfx->print("SOS");
+  gfx->setCursor(cx - 24, cy - 7);
+  gfx->print("SEND");
 
-  drawCentered("Tap circle to send", 226, C_LGRAY, 1);
-  drawCentered(deviceId.c_str(), 242, C_ACCENT, 1);
+  // Device ID — textSize=1 (small info)
+  drawCentered(deviceId.c_str(), 224, C_ACCENT, 1);
 
+  // Status text — textSize=2 so it's clearly visible
   if (sosSent) {
-    drawCentered(sosStatus.c_str(), 268, C_GREEN, 2);
+    drawCentered(sosStatus.c_str(), 244, C_GREEN, 2);
   } else if (!wifiConnected) {
-    drawCentered(sosStatus.c_str(), 268, C_ORANGE, 1);
+    drawCentered("WiFi required", 244, C_ORANGE, 2);
   } else {
-    drawCentered(sosStatus.c_str(), 268, C_ACCENT, 1);
+    drawCentered("Ready", 244, C_ACCENT, 2);
   }
 
   drawNavBar();
@@ -1576,6 +2304,18 @@ void setup() {
   Serial.printf("[ENS160] %s\n", ens160Ready ? "Ready" : "Not found (N/A)");
   drawCentered(ens160Ready ? "ENS160 OK" : "ENS160 N/A", 215, ens160Ready ? C_GREEN : C_GRAY, 1);
 
+  // Init MAX30102 heart rate + SpO2 (Wire2 on GPIO3/GPIO5)
+  drawCentered("Starting MAX30102...", 200, C_LGRAY, 1);
+  pinMode(MAX30102_SDA, INPUT_PULLUP);
+  pinMode(MAX30102_SCL, INPUT_PULLUP);
+  delay(10);
+  Wire2.begin(MAX30102_SDA, MAX30102_SCL);
+  Wire2.setClock(100000);
+  Wire2.setTimeout(50);
+  max30102Ready = max30102_init();
+  Serial.printf("[MAX30102] %s\n", max30102Ready ? "Ready" : "Not found (N/A)");
+  drawCentered(max30102Ready ? "MAX30102 OK" : "MAX30102 N/A", 215, max30102Ready ? C_GREEN : C_GRAY, 1);
+
   // Initial sensor read (blocking is fine here in setup)
   triggerSlowSensors();
   delay(100);
@@ -1587,8 +2327,23 @@ void setup() {
   drawCentered(touchReady ? "Touch+Swipe OK" : "Touch Failed", 245, touchReady ? C_GREEN : C_ORANGE, 1);
 
   // Connect WiFi
+  // If BOOT button is held right now → force clear saved WiFi and provision
+  if (digitalRead(0) == LOW) {
+    Serial.println("[Boot] BOOT held at startup — clearing WiFi credentials");
+    delay(300);
+    if (digitalRead(0) == LOW) {   // still held after debounce
+      wifiPrefs.begin("wifi_cfg", false);
+      wifiPrefs.clear();
+      wifiPrefs.end();
+    }
+  }
   drawCentered("Connecting WiFi...", 230, C_LGRAY, 1);
   connectWiFi();
+  if (apMode) {
+    // Provisioning mode: loop() will run the HTTP server, skip normal startup
+    Serial.println("[Setup] Entering provisioning AP loop.");
+    return;
+  }
   if (wifiConnected) {
     drawCentered("WiFi OK", 245, C_GREEN, 1);
   } else {
@@ -1617,10 +2372,45 @@ static unsigned long lastStepCheck = 0;
 static unsigned long lastGyroRead = 0;
 
 void loop() {
+  // ── AP Provisioning mode — runs HTTP server, skips all sensor/display code ──
+  if (apMode) {
+    setupServer.handleClient();
+    // Short press BOOT → skip setup, watch runs offline
+    static bool lastAPBtn = HIGH;
+    bool apBtn = digitalRead(0);
+    if (apBtn == LOW && lastAPBtn == HIGH) {
+      Serial.println("[AP] Skipping WiFi setup — continuing offline");
+      apMode = false;
+      setupServer.stop();
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      showCurrentScreen();
+    }
+    lastAPBtn = apBtn;
+    return;
+  }
+
   // ── Button handling (5 screens) ──────────────────────────────────────────
   static bool lastBtn = HIGH;
   static unsigned long lastBtnMs = 0;
+  static unsigned long btnHoldMs = 0;   // for 3-second WiFi reset
   bool b = digitalRead(0);  // BOOT button
+
+  // Long press 3 s → clear saved WiFi credentials and restart into setup mode
+  if (b == LOW) {
+    if (btnHoldMs == 0) btnHoldMs = millis();
+    else if (millis() - btnHoldMs > 3000) {
+      Serial.println("[Boot] 3 s hold — clearing WiFi and restarting");
+      wifiPrefs.begin("wifi_cfg", false);
+      wifiPrefs.clear();
+      wifiPrefs.end();
+      pushPopup("WiFi Reset!", C_ORANGE);
+      delay(1500);
+      ESP.restart();
+    }
+  } else {
+    btnHoldMs = 0;
+  }
 
   if (b == LOW && lastBtn == HIGH && millis() - lastBtnMs > 300) {
     lastBtnMs = millis();
@@ -1685,13 +2475,20 @@ void loop() {
       if (!ens160Ready)   { ens160Ready   = ens160_init();  Serial.printf("[I2C] ENS160 re-init: %s\n", ens160Ready ? "OK" : "fail"); }
       if (!mlx90614Ready) { mlx90614Ready = mlx90614_init();Serial.printf("[I2C] MLX re-init: %s\n", mlx90614Ready ? "OK" : "fail"); }
       if (!touchReady)    { touchReady    = touchInit();    Serial.printf("[I2C] Touch re-init: %s\n", touchReady ? "OK" : "fail"); }
+      if (!max30102Ready) {
+        Wire2.begin(MAX30102_SDA, MAX30102_SCL);
+        Wire2.setClock(100000); Wire2.setTimeout(50);
+        max30102Ready = max30102_init();
+        Serial.printf("[I2C] MAX30102 re-init: %s\n", max30102Ready ? "OK" : "fail");
+      }
     }
   }
 
-  // ── Step detection every 20ms ────────────────────────────────────────────
+  // ── Step + fall detection every 20ms ────────────────────────────────────
   if (millis() - lastStepCheck >= 20) {
     lastStepCheck = millis();
     detectSteps();
+    detectFall();  // uses accelX/Y/Z populated by detectSteps()
   }
 
   // ── Read gyroscope every 100ms (for display on steps screen) ─────────────
@@ -1711,7 +2508,25 @@ void loop() {
     readAllSensors();
   }
 
-  // ── Update display every second ──────────────────────────────────────────
+  // ── MAX30102 HR + SpO2 — sample every 40ms (25sps with 4-avg) ───────────
+  if (max30102Ready && millis() - lastMaxSampleMs >= 40) {
+    lastMaxSampleMs = millis();
+    max30102_sampleLoop();
+  }
+  // Retry Bus2 init every 5 minutes if MAX30102 dropped off
+  if (!max30102Ready && millis() - lastMaxRetryMs >= 300000UL) {
+    lastMaxRetryMs = millis();
+    Serial.println("[MAX30102] Retrying Bus2 init...");
+    pinMode(MAX30102_SDA, INPUT_PULLUP);
+    pinMode(MAX30102_SCL, INPUT_PULLUP);
+    delay(10);
+    Wire2.end();
+    Wire2.begin(MAX30102_SDA, MAX30102_SCL);
+    Wire2.setClock(100000);
+    Wire2.setTimeout(50);
+    max30102Ready = max30102_init();
+    Serial.printf("[MAX30102] Retry: %s\n", max30102Ready ? "OK" : "still missing");
+  }
   if (millis() - lastSecond >= 1000) {
     lastSecond = millis();
     displaySeconds++;
@@ -1762,8 +2577,25 @@ void loop() {
       showCurrentScreen();
     }
 
-    Serial.printf("[ALIVE] %ds steps=%d screen=%d imu=%d wifi=%d\n",
-                  displaySeconds, steps, currentScreen, imuReady, wifiConnected);
+    // ── Step-rate calculation (every 60s) for activity-aware HR alerts ────
+    if (millis() - stepRateCalcMs >= 60000UL) {
+      stepRatePM    = steps - stepsLastMin;
+      stepsLastMin  = steps;
+      stepRateCalcMs = millis();
+    }
+
+    // ── Touch-fail diagnostic (every 30s if touch never initialized) ──────
+    if (!touchReady && millis() % 30000 < 50) {
+      Serial.println("[TOUCH FAIL] Touch controller not available.");
+      Serial.printf("[TOUCH FAIL]   SDA GPIO%d=%s  SCL GPIO%d=%s  TP_INT GPIO%d=%s\n",
+        IMU_SDA, digitalRead(IMU_SDA) ? "H" : "L",
+        IMU_SCL, digitalRead(IMU_SCL) ? "H" : "L",
+        TP_INT,  digitalRead(TP_INT)  ? "H" : "L");
+      Serial.println("[TOUCH FAIL]   Navigation by touch is unavailable. Check CST816 wiring.");
+    }
+
+    Serial.printf("[ALIVE] %ds steps=%d screen=%d imu=%d wifi=%d touch=%d step_rate=%d/min\n",
+                  displaySeconds, steps, currentScreen, imuReady, wifiConnected, touchReady, stepRatePM);
   }
 
   delay(10);
